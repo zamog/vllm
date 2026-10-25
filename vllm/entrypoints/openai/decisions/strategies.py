@@ -15,7 +15,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property, partial
-from typing import Any, ClassVar, TypeVar
+from typing import Any, ClassVar, Literal, TypeVar
 
 import numpy as np
 from PIL import Image
@@ -1370,6 +1370,73 @@ class D3Strategy(ReadStrategy):
         assert engine_input["type"] == "multimodal"
         return engine_input
 
+    def _state_writer(
+        self, prompt_ids: Sequence[Sequence[int]], state_tokens: Sequence[int]
+    ) -> int | Literal["state"] | None:
+        """What to prefill before the other questions so they reuse the cached
+        state block: the question whose own prefill saves the state's last
+        cacheable boundary, "state" for the state block alone, or None.
+
+        With prefix caching, a question's hit stops at its state block and at
+        the last Gated DeltaNet state saved on a Mamba block boundary, c. A
+        prompt prefilled from 0 saves that state at its own last boundary, so
+        a question that ends within the state's last block saves it at c.
+        Prompts prefilled together reuse nothing of each other."""
+        cache_config = self.context.engine_client.vllm_config.cache_config
+        block = cache_config.mamba_block_size
+        if (
+            not self.state_blocks
+            or not cache_config.enable_prefix_caching
+            or not block
+            or len(prompt_ids) < 2
+            or len(set(state_tokens)) != 1
+            or state_tokens[0] <= block
+        ):
+            return None
+        last_boundary = (state_tokens[0] - 1) // block * block
+        shortest = min(range(len(prompt_ids)), key=lambda n: len(prompt_ids[n]))
+        if len(prompt_ids[shortest]) - 1 < last_boundary + block:
+            return shortest
+        return "state"
+
+    async def _warm_state(
+        self,
+        engine_input: EngineInput,
+        state_tokens: int,
+        request_id: str,
+        *,
+        lora_request: LoRARequest | None,
+        trace_headers: Mapping[str, str] | None,
+        priority: int,
+    ) -> None:
+        """Prefill a prompt's state block alone, so the questions after it
+        reuse it. A failure only costs the reuse."""
+        state_input = {
+            **engine_input,
+            "prompt_token_ids": list(engine_input["prompt_token_ids"][:state_tokens]),
+        }
+        params = PoolingParams(
+            task="classify",
+            use_activation=False,
+            extra_kwargs={self.STATE_TOKENS: state_tokens},
+        )
+        try:
+            async for _ in self.context.engine_client.encode(
+                state_input,  # type: ignore[arg-type]
+                params,
+                request_id,
+                lora_request=lora_request,
+                trace_headers=trace_headers,
+                priority=priority,
+            ):
+                pass
+        except Exception:
+            logger.warning(
+                "Prefilling the state block of %s failed; its questions read it again",
+                request_id,
+                exc_info=True,
+            )
+
     async def read(
         self,
         questions: list[Question],
@@ -1451,12 +1518,28 @@ class D3Strategy(ReadStrategy):
                 )
             return result.outputs.data.tolist()
 
-        logits = await asyncio.gather(
-            *(read_one(n, inputs) for n, inputs in enumerate(engine_inputs))
-        )
+        first = self._state_writer(prompt_ids, state_tokens)
+        logits: list[list[float] | None] = [None] * len(engine_inputs)
+        if first == "state":
+            await self._warm_state(
+                engine_inputs[0],
+                state_tokens[0],
+                f"{request_id}-state",
+                lora_request=lora_request,
+                trace_headers=trace_headers,
+                priority=priority,
+            )
+        elif first is not None:
+            logits[first] = await read_one(first, engine_inputs[first])
+        rest = [n for n in range(len(engine_inputs)) if logits[n] is None]
+        for n, read in zip(
+            rest, await asyncio.gather(*(read_one(n, engine_inputs[n]) for n in rest))
+        ):
+            logits[n] = read
 
         reads = []
         for q, ids, code_logits in zip(questions, prompt_ids, logits):
+            assert code_logits is not None
             texts, order = self._options(q)
             scaled = [v / self.temperature for v in code_logits[: len(texts)]]
             probs = label_softmax(scaled)

@@ -373,7 +373,8 @@ vllm serve vllm-sr/d3-turbo --max-model-len 131072
   chunked prefill and prefix caching are off. `prefix_bidir` runs on CUDA and
   ROCm GPUs with Model Runner V2 and an attention backend that takes PrefixLM
   ranges, which vLLM selects (Triton, or FlashAttention 4 where available).
-  The state is read again for each question of a request.
+  The state is read again for each question of a request, unless its state
+  block is cached (below).
 - `instructions` returns 400, since the prompt is fixed.
   `chat_template_kwargs` has no effect.
 - `images` and `videos` are placed before the text, images read at up to
@@ -384,6 +385,32 @@ vllm serve vllm-sr/d3-turbo --max-model-len 131072
   first codes, one per option, belong to a question. A `prefix_bidir` prompt
   sent there reads as a single block; `LLM.classify` takes its state block's
   token count as `PoolingParams(extra_kwargs={"prefix_lm_len": n})`.
+
+With `prefix_bidir`, the state block reads only itself, so the questions of a
+request can share it. `--enable-prefix-caching` caches it:
+
+```bash
+vllm serve vllm-sr/d3-turbo --max-model-len 65536 --enable-prefix-caching \
+    --attention-config '{"backend": "FLASH_ATTN", "flash_attn_version": 4}'
+```
+
+- The first read of a request prefills the state block and saves it; the
+  other questions then read only the end of the state's last Mamba block and
+  their own tokens. The first read is the shortest question when it ends
+  within the state's last Mamba block, else the state block alone.
+- Each prompt is prefilled whole in one step, so `--max-num-batched-tokens`
+  is at least `--max-model-len`; the Gated DeltaNet state cache is float32.
+  Speculative decoding, KV connectors and offloading, context parallelism,
+  micro-batching and `--prefix-match-unit` are not supported with it. The
+  noncausal sizes cache nothing.
+- The state block is cached with its exact tokens and media: requests that
+  reuse a state send the same state text and media. A question that depends
+  on another's answer goes in a later request with that answer in its own
+  text, never in the state.
+- For many requests over many states, send each state's questions together
+  and in order of state, so a cached state is still there when they arrive.
+- On Hopper GPUs, FlashAttention 4 reads the state and question blocks;
+  without it the prompts run on Triton attention.
 
 ### Liquid d1
 
