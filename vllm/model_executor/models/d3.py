@@ -28,7 +28,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
 from .adapters import as_seq_cls_model
 from .interfaces_base import default_pooling_type
@@ -68,10 +68,14 @@ class D3ProcessingInfo(Qwen3_5ProcessingInfo):
         return processor
 
 
-class D3PrefixBidirModelState(DefaultModelState):
+class D3PrefixBidirModelState(MambaHybridModelState):
     """Model Runner V2 state of a `prefix_bidir` checkpoint: a request's state
     block and question block are the PrefixLM ranges of its attention, so the
-    attention is causal across them and bidirectional within each."""
+    attention is causal across them and bidirectional within each.
+
+    It keeps the hybrid state the runner picks for Qwen3.5 otherwise: the
+    Gated DeltaNet metadata and, with prefix caching, the Mamba "align" state
+    bookkeeping."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
