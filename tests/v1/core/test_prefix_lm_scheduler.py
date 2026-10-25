@@ -19,6 +19,7 @@ from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched import prefix_lm_scheduler
 from vllm.v1.core.sched.prefix_lm_scheduler import (
     PREFIX_LM_LEN,
+    BidirectionalPrefixLMScheduler,
     PrefixLMAsyncScheduler,
     PrefixLMScheduler,
     prefix_lm_salt,
@@ -167,6 +168,26 @@ def test_pooling_requests_send_their_prefix_in_extra_kwargs():
     )
     scheduler.add_request(across)
     assert PREFIX_LM_LEN not in across.pooling_params.extra_kwargs
+
+
+def test_a_bidirectional_prompt_without_prefix_length_is_one_prefix():
+    """For a model that reads a prompt without a prefix length in both
+    directions, the prompt is one prefix: it hits only the same prompt."""
+    scheduler = make_scheduler(cls=BidirectionalPrefixLMScheduler)
+    first = list(range(100, 170))
+    other = first[:40] + [7] * 30
+    assert step(scheduler, make_request("first", first, None)) == {"first": (0, 70)}
+    # The same first 40 tokens, but every block depends on the whole prompt.
+    assert step(scheduler, make_request("other", other, None)) == {"other": (0, 70)}
+    # The same prompt again hits up to its Mamba checkpoint at 64.
+    assert step(scheduler, make_request("again", first, None)) == {"again": (64, 6)}
+    request = make_request("salted", first, None)
+    scheduler.add_request(request)
+    assert request.cache_salt == prefix_lm_salt(first, None)
+    # PrefixLMScheduler reads the same prompt causally, with no salt.
+    causal = make_request("causal", first, None)
+    make_scheduler().add_request(causal)
+    assert causal.cache_salt is None
 
 
 def test_prompt_one_token_over_budget_waits():
@@ -344,13 +365,14 @@ def test_warns_when_prefixes_cannot_be_cached(monkeypatch, checkpoint_blocks):
     assert warning.called == (checkpoint_blocks == 0)
 
 
+@pytest.mark.parametrize("name", ["PrefixLM", "BidirectionalPrefixLM"])
 @pytest.mark.parametrize("kind", ["", "Async"])
-def test_async_scheduling_takes_the_async_twin(monkeypatch, kind):
+def test_async_scheduling_takes_the_async_twin(monkeypatch, name, kind):
     # Keep the platform from deciding async scheduling.
     monkeypatch.setattr(
         type(current_platform), "check_and_update_config", classmethod(lambda *_: None)
     )
-    cls = "vllm.v1.core.sched.prefix_lm_scheduler.PrefixLM{}Scheduler"
+    cls = f"vllm.v1.core.sched.prefix_lm_scheduler.{name}{{}}Scheduler"
     config = VllmConfig(
         model_config=ModelConfig(model="facebook/opt-125m", skip_tokenizer_init=True),
         scheduler_config=SchedulerConfig.default_factory(

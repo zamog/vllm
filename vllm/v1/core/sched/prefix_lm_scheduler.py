@@ -87,10 +87,6 @@ def _request_params(request: Request) -> SamplingParams | PoolingParams | None:
     return request.sampling_params or request.pooling_params
 
 
-def _request_prefix_lm_len(request: Request) -> int | None:
-    return prefix_lm_len(_request_params(request), request.prompt_token_ids)
-
-
 def _drop_prefix_lm_len(request: Request) -> None:
     """Remove the prefix length from a copy of the request's params."""
     params = copy.copy(_request_params(request))
@@ -106,6 +102,11 @@ def _drop_prefix_lm_len(request: Request) -> None:
 
 
 class PrefixLMScheduler(Scheduler):
+    #: Whether a prompt without a prefix length is a prefix as a whole, for
+    #: models that read such a prompt in both directions. Otherwise it is
+    #: read causally.
+    whole_prompt_prefix_by_default = False
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # Scheduler calls _mamba_block_aligned_split only in this mode.
@@ -126,8 +127,21 @@ class PrefixLMScheduler(Scheduler):
                 type(self).__name__,
             )
 
+    def _prefix_lm_len(self, request: Request) -> int | None:
+        """The PrefixLM prefix length of a request, else None (causal)."""
+        prompt_token_ids = request.prompt_token_ids
+        prefix_len = prefix_lm_len(_request_params(request), prompt_token_ids)
+        if (
+            prefix_len is None
+            and self.whole_prompt_prefix_by_default
+            and prompt_token_ids
+            and not request.resumable
+        ):
+            return len(prompt_token_ids)
+        return prefix_len
+
     def add_request(self, request: Request) -> None:
-        prefix_len = _request_prefix_lm_len(request)
+        prefix_len = self._prefix_lm_len(request)
         if prefix_len is not None and (
             request.resumable or _straddles(request.mm_features, prefix_len)
         ):
@@ -146,7 +160,7 @@ class PrefixLMScheduler(Scheduler):
 
     def _salt_by_kind(self, request: Request) -> None:
         """Salt PrefixLM requests by prefix; keep causal requests out."""
-        prefix_len = _request_prefix_lm_len(request)
+        prefix_len = self._prefix_lm_len(request)
         salt = request.cache_salt
         if prefix_len is None:
             if not (salt and salt.startswith(PREFIX_LM_SALT)):
@@ -167,7 +181,7 @@ class PrefixLMScheduler(Scheduler):
     def _get_local_prefix_cache_hit(
         self, request: Request, max_cache_hit_length: int | None = None
     ) -> tuple[KVCacheBlocks, int, int, bool]:
-        prefix_len = _request_prefix_lm_len(request)
+        prefix_len = self._prefix_lm_len(request)
         if prefix_len is not None:
             # KV past the prefix depends on the rest of the prompt. The last
             # token is always computed to get its logits.
@@ -197,7 +211,7 @@ class PrefixLMScheduler(Scheduler):
         if (
             scheduled[1] < num_new_tokens
             and num_computed_tokens < request.num_prompt_tokens
-            and _request_prefix_lm_len(request) is not None
+            and self._prefix_lm_len(request) is not None
         ):
             # An encoder budget or cache limit would split the prompt; wait
             # for a step that can encode all of it. Drop the references this
@@ -222,7 +236,7 @@ class PrefixLMScheduler(Scheduler):
         )
         prefix_lm = (
             start < request.num_prompt_tokens
-            and _request_prefix_lm_len(request) is not None
+            and self._prefix_lm_len(request) is not None
         )
         if (
             prefix_lm
@@ -245,3 +259,16 @@ class PrefixLMScheduler(Scheduler):
 
 
 class PrefixLMAsyncScheduler(PrefixLMScheduler, AsyncScheduler): ...
+
+
+class BidirectionalPrefixLMScheduler(PrefixLMScheduler):
+    """PrefixLMScheduler for models that read a prompt without a prefix length
+    in both directions: such a prompt is one prefix, cached only for the same
+    prompt."""
+
+    whole_prompt_prefix_by_default = True
+
+
+class BidirectionalPrefixLMAsyncScheduler(
+    BidirectionalPrefixLMScheduler, AsyncScheduler
+): ...
