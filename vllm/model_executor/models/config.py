@@ -1150,7 +1150,8 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
             # The full attention layers stay decoder layers that read each
             # request's state and question blocks as PrefixLM ranges
             # (`D3PrefixBidirModelState`). The prompt as a whole is still read
-            # bidirectionally, so chunked prefill and prefix caching stay off.
+            # bidirectionally, so chunked prefill and prefix caching stay off
+            # unless prefix caching is asked for (`_enable_state_caching`).
             if model_config.hf_text_config is hf_config:
                 raise ValueError("prefix_bidir needs a separate text config")
             hf_config.is_causal = False
@@ -1181,6 +1182,140 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
         assert pooler_config is not None
         if pooler_config.use_activation is None:
             pooler_config.use_activation = False
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        decision = model_config.hf_config.decision_config
+        attention_mode = decision.get("attention_mode", "causal")
+        if attention_mode == "noncausal_full_attention":
+            if cache_config.enable_prefix_caching:
+                logger.info(
+                    "Disabling prefix caching for %s: its full attention reads "
+                    "the whole prompt in both directions, so no block is reusable",
+                    model_config.architecture,
+                )
+                cache_config.enable_prefix_caching = False
+            return
+        if attention_mode != "prefix_bidir":
+            return
+        D3ForSequenceClassificationConfig._check_prefix_bidir_attention(vllm_config)
+        if cache_config.enable_prefix_caching:
+            D3ForSequenceClassificationConfig._enable_state_caching(vllm_config)
+
+    @staticmethod
+    def _check_prefix_bidir_attention(vllm_config: "VllmConfig") -> None:
+        """On Hopper only FlashAttention 4 applies the state and question
+        blocks; otherwise every prompt step runs on Triton attention."""
+        from vllm.platforms import current_platform
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        attention_config = vllm_config.attention_config
+        if (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(90)
+            and not (
+                attention_config.backend == AttentionBackendEnum.FLASH_ATTN
+                and attention_config.flash_attn_version == 4
+            )
+        ):
+            logger.warning(
+                "%s prefix_bidir prompts run on Triton attention on this GPU; "
+                "FlashAttention 4 is faster: --attention-config "
+                '\'{"backend": "FLASH_ATTN", "flash_attn_version": 4}\'',
+                vllm_config.model_config.architecture,
+            )
+
+    @staticmethod
+    def _enable_state_caching(vllm_config: "VllmConfig") -> None:
+        """Cache each prompt's state block (a PrefixLM prefix): prefill every
+        prompt from its cache hit in one step with
+        BidirectionalPrefixLMScheduler, and keep the Gated DeltaNet state of
+        the cached state blocks in float32."""
+        from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn
+        from vllm.platforms import current_platform
+
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        scheduler_config = vllm_config.scheduler_config
+        architecture = model_config.architecture
+
+        _, gdn = qwen_gdn_linear_attn._resolve_gdn_prefill_backend(vllm_config)
+        if not (
+            gdn == "flashinfer"
+            or (gdn in ("triton", "aiter_flydsl") and current_platform.is_cuda_alike())
+        ):
+            logger.info(
+                "Disabling prefix caching for %s: the %s GDN prefill backend "
+                "saves no state inside a prefill step",
+                architecture,
+                gdn,
+            )
+            cache_config.enable_prefix_caching = False
+            return
+
+        prefix_lm = "vllm.v1.core.sched.prefix_lm_scheduler."
+        schedulers = (
+            f"{prefix_lm}BidirectionalPrefixLMScheduler",
+            f"{prefix_lm}BidirectionalPrefixLMAsyncScheduler",
+        )
+        unsupported = {
+            "KV transfer connectors": vllm_config.kv_transfer_config,
+            "--kv-offloading-size": cache_config.kv_offloading_size is not None,
+            "speculative decoding": vllm_config.speculative_config,
+            "context parallelism": (
+                vllm_config.parallel_config.prefill_context_parallel_size > 1
+                or vllm_config.parallel_config.decode_context_parallel_size > 1
+            ),
+            "micro-batching": vllm_config.parallel_config.use_ubatching,
+            "--prefix-match-unit": cache_config.prefix_match_unit,
+            "--scheduler-cls": scheduler_config.scheduler_cls
+            not in (None, *schedulers),
+        }
+        if features := [name for name, enabled in unsupported.items() if enabled]:
+            raise ValueError(
+                f"Prefix caching of {architecture} prefix_bidir prompts does not "
+                f"support {', '.join(features)}"
+            )
+
+        # A cached state block resumes the Gated DeltaNet state saved at its
+        # last block boundary; in bfloat16 that state would differ from the
+        # one a full prefill carries.
+        if cache_config.mamba_ssm_cache_dtype == "auto":
+            cache_config.mamba_ssm_cache_dtype = "float32"
+        elif cache_config.mamba_ssm_cache_dtype != "float32":
+            raise ValueError(
+                f"Prefix caching of {architecture} prefix_bidir prompts needs "
+                "--mamba-ssm-cache-dtype float32, not "
+                f"{cache_config.mamba_ssm_cache_dtype}"
+            )
+
+        # Each prompt is prefilled from its cache hit in one step; the Mamba
+        # prefix cache needs chunked prefill on for that.
+        scheduler_config.enable_chunked_prefill = True
+        scheduler_config.long_prefill_token_threshold = 0
+        scheduler_config.scheduler_cls = schedulers[0]
+        if not scheduler_config.user_specified_max_num_batched_tokens:
+            scheduler_config.max_num_batched_tokens = max(
+                scheduler_config.max_num_batched_tokens, model_config.max_model_len
+            )
+        budgets = {
+            "--max-num-batched-tokens": scheduler_config.max_num_batched_tokens,
+            "--max-num-scheduled-tokens": scheduler_config.max_num_scheduled_tokens,
+        }
+        for flag, budget in budgets.items():
+            if budget is not None and budget < model_config.max_model_len:
+                raise ValueError(
+                    f"Prefix caching of {architecture} prefix_bidir prompts "
+                    f"prefills each prompt in one step, so {flag} ({budget}) "
+                    f"must be at least --max-model-len ({model_config.max_model_len})"
+                )
+        logger.info(
+            "Caching the state blocks of %s prefix_bidir prompts",
+            architecture,
+        )
 
 
 class SnowflakeGteNewModelConfig(VerifyAndUpdateConfig):
