@@ -18,6 +18,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request
 
@@ -256,6 +257,21 @@ class PrefixLMScheduler(Scheduler):
             # Zero keeps the request waiting at the head of the queue.
             return 0
         return num_new_tokens
+
+    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        super()._update_after_schedule(scheduler_output)
+        # A prompt split across steps reads its bidirectional ranges in parts,
+        # which changes its outputs silently.
+        for req_id in scheduler_output.num_scheduled_tokens:
+            request = self.requests[req_id]
+            assert (
+                request.num_computed_tokens >= request.num_prompt_tokens
+                or self._prefix_lm_len(request) is None
+            ), (
+                f"PrefixLM request {req_id} was scheduled in part: "
+                f"{request.num_computed_tokens} of {request.num_prompt_tokens} "
+                "prompt tokens"
+            )
 
 
 class PrefixLMAsyncScheduler(PrefixLMScheduler, AsyncScheduler): ...

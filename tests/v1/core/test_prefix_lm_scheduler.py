@@ -190,6 +190,23 @@ def test_a_bidirectional_prompt_without_prefix_length_is_one_prefix():
     assert causal.cache_salt is None
 
 
+def test_a_split_prefix_lm_prompt_fails_loudly(monkeypatch):
+    """If a change lets the stock Mamba split cut a PrefixLM prompt, the step
+    fails instead of reading the prompt's ranges in parts."""
+    monkeypatch.setattr(
+        PrefixLMScheduler,
+        "_mamba_block_aligned_split",
+        Scheduler._mamba_block_aligned_split,
+    )
+    scheduler = make_scheduler(64)
+    with pytest.raises(AssertionError, match="scheduled in part: 64 of 70"):
+        step(scheduler, make_request("q", list(range(70)), 40))
+    # A causal prompt may be split.
+    assert step(make_scheduler(64), make_request("c", list(range(70)), None)) == {
+        "c": (0, 64)
+    }
+
+
 def test_prompt_one_token_over_budget_waits():
     # a leaves 32 tokens of budget for b's 33, and 32 is block aligned.
     scheduler = make_scheduler(102)
