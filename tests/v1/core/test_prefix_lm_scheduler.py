@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """PrefixLMScheduler on a full attention + Mamba ("align" cache mode) model."""
 
+from dataclasses import replace
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -10,6 +13,7 @@ from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched import prefix_lm_scheduler
 from vllm.v1.core.sched.prefix_lm_scheduler import (
     PREFIX_LM_LEN,
     PrefixLMAsyncScheduler,
@@ -165,6 +169,19 @@ def test_streamed_requests_are_read_causally():
 def test_needs_mamba_align_mode():
     with pytest.raises(ValueError, match="align"):
         create_scheduler(skip_tokenizer_init=True, scheduler_cls=PrefixLMScheduler)
+
+
+@pytest.mark.parametrize("checkpoint_blocks", [0, 1])
+def test_warns_when_prefixes_cannot_be_cached(monkeypatch, checkpoint_blocks):
+    warning = Mock()
+    monkeypatch.setattr(prefix_lm_scheduler.logger, "warning", warning)
+    create_scheduler(
+        enable_prefix_caching=True,
+        skip_tokenizer_init=True,
+        mamba_spec=replace(MAMBA, num_prefill_checkpoint_blocks=checkpoint_blocks),
+        scheduler_cls=PrefixLMScheduler,
+    )
+    assert warning.called == (checkpoint_blocks == 0)
 
 
 @pytest.mark.parametrize("kind", ["", "Async"])

@@ -64,6 +64,17 @@ class PrefixLMScheduler(Scheduler):
                 f"{type(self).__name__} needs a hybrid model in Mamba 'align' "
                 "cache mode"
             )
+        if not self.mamba_has_prefill_checkpoint_blocks:
+            # A prefix is prefilled with the rest of its prompt in one chunk,
+            # so its Mamba state is cached inside the chunk only if the backend
+            # saves it there; otherwise only at a chunk end on a Mamba block
+            # boundary.
+            logger.warning(
+                "The Mamba backend saves no prefill checkpoints, so %s caches "
+                "only PrefixLM prefixes that are whole prompts ending on a "
+                "Mamba block boundary",
+                type(self).__name__,
+            )
 
     def add_request(self, request: Request) -> None:
         params = request.sampling_params
