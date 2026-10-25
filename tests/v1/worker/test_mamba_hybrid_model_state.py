@@ -38,6 +38,7 @@ HAS_GPU = current_platform.is_cuda_alike() or current_platform.is_xpu()
 
 def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> None:
     state = object.__new__(MambaHybridModelState)
+    state.supports_mm_inputs = False
     state.vllm_config = SimpleNamespace(num_speculative_tokens=0)
     state.model_config = SimpleNamespace(max_model_len=8192)
     state._align_mode = False
@@ -104,6 +105,7 @@ def test_padded_prompt_tail_builds_as_spec_decode(
     """
     k = 3
     state = object.__new__(MambaHybridModelState)
+    state.supports_mm_inputs = False
     state.vllm_config = SimpleNamespace(num_speculative_tokens=k)
     state.model_config = SimpleNamespace(max_model_len=8192)
     state._align_mode = False
@@ -169,6 +171,7 @@ def test_padded_prompt_tail_builds_as_spec_decode(
 
 def _mamba_hybrid_state(num_speculative_tokens: int) -> MambaHybridModelState:
     state = object.__new__(MambaHybridModelState)
+    state.supports_mm_inputs = False
     state.vllm_config = SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
     state.model_config = SimpleNamespace(max_model_len=8192)
     state._align_mode = False
