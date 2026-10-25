@@ -925,7 +925,7 @@ async def test_d3_prefix_bidir_sends_each_prompts_state_block(d3):
     assert engine.encode.call_count == 3
     for call in engine.encode.call_args_list:
         ids = call.args[0]["prompt_token_ids"]
-        state = call.args[1].extra_kwargs["d3_state_tokens"]
+        state = call.args[1].extra_kwargs["prefix_lm_len"]
         assert tokenizer.decode(ids[:state]).endswith(
             "<|im_start|>user\nState:\nMy card was charged twice"
         )

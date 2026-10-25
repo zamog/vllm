@@ -383,7 +383,7 @@ vllm serve vllm-sr/d3-turbo --max-model-len 131072
 - `/classify` and `/pooling` return the raw logits of all 255 codes; only the
   first codes, one per option, belong to a question. A `prefix_bidir` prompt
   sent there reads as a single block; `LLM.classify` takes its state block's
-  token count as `PoolingParams(extra_kwargs={"d3_state_tokens": n})`.
+  token count as `PoolingParams(extra_kwargs={"prefix_lm_len": n})`.
 
 ### Liquid d1
 

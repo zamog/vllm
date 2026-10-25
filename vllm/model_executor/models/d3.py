@@ -27,6 +27,7 @@ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.prefix_lm_scheduler import PREFIX_LM_LEN
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
@@ -40,8 +41,9 @@ logger = init_logger(__name__)
 
 READOUT_WEIGHTS = "readout.safetensors"
 # The `PoolingParams.extra_kwargs` key of a `prefix_bidir` request's state block
-# token count, set by the System One strategy.
-STATE_TOKENS = "d3_state_tokens"
+# token count, set by the System One strategy. It is the PrefixLM prefix length
+# that PrefixLMScheduler caches by.
+STATE_TOKENS = PREFIX_LM_LEN
 
 # The media budgets of the checkpoint's runtime (`d3_runtime.py`), which differ
 # from its processor config: images at 65,536 to 1,638,400 pixels, video frames

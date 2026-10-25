@@ -1217,7 +1217,7 @@ class D3Strategy(ReadStrategy):
     VIDEO_MAX_FRAMES = 32
     #: `PoolingParams.extra_kwargs` key of a prefix_bidir prompt's state block
     #: size (`vllm.model_executor.models.d3.STATE_TOKENS`).
-    STATE_TOKENS = "d3_state_tokens"
+    STATE_TOKENS = "prefix_lm_len"
 
     def __init__(self, context: ReadContext):
         super().__init__(context)

@@ -151,7 +151,7 @@ def test_d3_prefix_bidir_matches_the_checkpoint_runtime(
             [{"prompt_token_ids": ids} for ids in sequences]
             + [{"prompt": image_prompt, "multi_modal_data": {"image": image}}],
             pooling_params=[
-                PoolingParams(extra_kwargs={"d3_state_tokens": state})
+                PoolingParams(extra_kwargs={"prefix_lm_len": state})
                 for state in states
             ],
             use_tqdm=False,
