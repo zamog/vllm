@@ -12,6 +12,7 @@ from collections.abc import Sequence
 import numpy as np
 
 from vllm.logger import init_logger
+from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -42,13 +43,32 @@ def prefix_lm_len(
     return None
 
 
-def prefix_lm_salt(prefix_token_ids: Sequence[int], cache_salt: str | None) -> str:
-    """PrefixLM `cache_salt`: namespace, prefix digest, then the caller's salt."""
-    digest = hashlib.sha256(
-        np.asarray(prefix_token_ids, dtype="<i8").tobytes()
-    ).hexdigest()
-    salt = PREFIX_LM_SALT + digest
+def prefix_lm_salt(
+    prefix_token_ids: Sequence[int],
+    cache_salt: str | None,
+    mm_features: Sequence[MultiModalFeatureSpec] = (),
+) -> str:
+    """PrefixLM `cache_salt`: namespace, prefix digest, then the caller's salt.
+
+    The digest covers the media inside the prefix too: their placeholder
+    tokens are the same for every item, and every prefix block attends to
+    every item."""
+    digest = hashlib.sha256(np.asarray(prefix_token_ids, dtype="<i8").tobytes())
+    for feature in mm_features:
+        if feature.mm_position.offset < len(prefix_token_ids):
+            digest.update(
+                f"\0{feature.identifier}@{feature.mm_position.offset}".encode()
+            )
+    salt = PREFIX_LM_SALT + digest.hexdigest()
     return f"{salt}:{cache_salt}" if cache_salt else salt
+
+
+def _straddles(features: Sequence[MultiModalFeatureSpec], position: int) -> bool:
+    """Whether a media item starts before `position` and ends after it."""
+    return any(
+        f.mm_position.offset < position < f.mm_position.offset + f.mm_position.length
+        for f in features
+    )
 
 
 def _request_prefix_lm_len(request: Request) -> int | None:
@@ -78,16 +98,18 @@ class PrefixLMScheduler(Scheduler):
 
     def add_request(self, request: Request) -> None:
         params = request.sampling_params
-        if (
-            (request.resumable or request.mm_features)
-            and params is not None
-            and PREFIX_LM_LEN in (params.extra_args or {})
+        prefix_len = _request_prefix_lm_len(request)
+        if prefix_len is not None and (
+            request.resumable or _straddles(request.mm_features, prefix_len)
         ):
-            # Later inputs and encoder budgets can cut such a prompt short.
+            # Later inputs can cut a streamed prompt short; a media item can
+            # be read in only one of the prefix and the rest.
             logger.warning_once(
-                "Requests with streamed or multimodal inputs ignore %s",
+                "Requests with streamed inputs or a media item across the "
+                "prefix end ignore %s",
                 PREFIX_LM_LEN,
             )
+            assert params is not None
             request.sampling_params = params = copy.copy(params)
             params.extra_args = dict(params.extra_args or {})
             del params.extra_args[PREFIX_LM_LEN]
@@ -106,7 +128,9 @@ class PrefixLMScheduler(Scheduler):
             salt = f"causal:{salt}"
         else:
             assert request.prompt_token_ids is not None
-            own = prefix_lm_salt(request.prompt_token_ids[:prefix_len], None)
+            own = prefix_lm_salt(
+                request.prompt_token_ids[:prefix_len], None, request.mm_features
+            )
             if salt == own or (salt and salt.startswith(f"{own}:")):
                 return
             salt = f"{own}:{salt}" if salt else own
@@ -126,6 +150,37 @@ class PrefixLMScheduler(Scheduler):
                 prefix_len = min(prefix_len, max_cache_hit_length)
             max_cache_hit_length = prefix_len
         return super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
+
+    def _try_schedule_encoder_inputs(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        encoder_compute_budget: int,
+        shift_computed_tokens: int = 0,
+    ) -> tuple[list[int], int, int, list[int], list[int]]:
+        encoder_cache = self.encoder_cache_manager
+        held = set(encoder_cache.get_cached_input_ids(request))
+        scheduled = super()._try_schedule_encoder_inputs(
+            request,
+            num_computed_tokens,
+            num_new_tokens,
+            encoder_compute_budget,
+            shift_computed_tokens,
+        )
+        if (
+            scheduled[1] < num_new_tokens
+            and num_computed_tokens < request.num_prompt_tokens
+            and _request_prefix_lm_len(request) is not None
+        ):
+            # An encoder budget or cache limit would split the prompt; wait
+            # for a step that can encode all of it. Drop the references this
+            # call took on cached inputs: a waiting request holding them keeps
+            # them from being evicted, which can starve it and others.
+            for input_id in encoder_cache.get_cached_input_ids(request) - held:
+                encoder_cache.free_encoder_input(request, input_id)
+            return [], 0, encoder_compute_budget, [], []
+        return scheduled
 
     def _mamba_block_aligned_split(
         self,

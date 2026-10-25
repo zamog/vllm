@@ -9,9 +9,11 @@ import pytest
 import torch
 
 from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
+from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched import prefix_lm_scheduler
 from vllm.v1.core.sched.prefix_lm_scheduler import (
@@ -51,10 +53,25 @@ def make_scheduler(budget: int = 256, cls: type[Scheduler] = PrefixLMScheduler):
     )
 
 
-def make_request(req_id, prompt, prefix_len, salt="own", resumable=False):
+def image(identifier: str, offset: int, length: int) -> MultiModalFeatureSpec:
+    return MultiModalFeatureSpec(
+        data=None,
+        modality="image",
+        identifier=identifier,
+        mm_position=PlaceholderRange(offset=offset, length=length),
+    )
+
+
+def make_request(
+    req_id, prompt, prefix_len, salt="own", resumable=False, mm_features=None
+):
     """A PrefixLM request with the strategy's salt, or causal if prefix_len is None."""
     if salt == "own":
-        salt = None if prefix_len is None else prefix_lm_salt(prompt[:prefix_len], None)
+        salt = (
+            None
+            if prefix_len is None
+            else prefix_lm_salt(prompt[:prefix_len], None, mm_features or ())
+        )
     extra_args = None if prefix_len is None else {PREFIX_LM_LEN: prefix_len}
     params = SamplingParams(max_tokens=1, extra_args=extra_args)
     params.update_from_generation_config({}, EOS_TOKEN_ID)
@@ -66,6 +83,7 @@ def make_request(req_id, prompt, prefix_len, salt="own", resumable=False):
         pooling_params=None,
         cache_salt=salt,
         resumable=resumable,
+        mm_features=mm_features,
         block_hasher=get_request_block_hasher(16, sha256),
     )
 
@@ -164,6 +182,108 @@ def test_requests_get_the_salt_of_their_prefix(prefix_len, salt, hit, expected):
 def test_streamed_requests_are_read_causally():
     request = make_request("streamed", list(range(150)), 40, resumable=True)
     assert step(make_scheduler(100), request) == {"streamed": (0, 96)}
+
+
+def test_media_inside_the_prefix_are_part_of_its_salt():
+    prompt = list(range(100))
+    salts = {
+        name: make_request(name, prompt, 64, salt=None, mm_features=media)
+        for name, media in {
+            "a": [image("a", 10, 20)],
+            "a_again": [image("a", 10, 20)],
+            "b": [image("b", 10, 20)],
+            "a_after": [image("a", 10, 20), image("c", 70, 20)],
+        }.items()
+    }
+    scheduler = make_scheduler()
+    for request in salts.values():
+        scheduler.add_request(request)
+    salt = {name: request.cache_salt for name, request in salts.items()}
+    assert salt["a"] == salt["a_again"] == salt["a_after"]  # only media in the prefix
+    assert salt["a"] != salt["b"]
+    assert salt["a"] == prefix_lm_salt(prompt[:64], None, [image("a", 10, 20)])
+    assert salt["a"] != prefix_lm_salt(prompt[:64], None)
+
+
+def test_media_across_the_prefix_end_reads_causally():
+    request = make_request(
+        "across", list(range(100)), 64, salt=None, mm_features=[image("a", 50, 20)]
+    )
+    make_scheduler().add_request(request)
+    assert PREFIX_LM_LEN not in request.sampling_params.extra_args
+
+
+def test_encoder_limits_never_split_a_prefix_lm_prompt(monkeypatch):
+    # An encoder budget that only fits the tokens before the image.
+    monkeypatch.setattr(
+        Scheduler,
+        "_try_schedule_encoder_inputs",
+        lambda self, request, computed, new, budget, shift=0: ([], 10, budget, [], []),
+    )
+    scheduler = make_scheduler()
+    media = [image("a", 10, 20)]
+    prefix_lm = make_request("p", list(range(100)), 64, mm_features=media)
+    causal = make_request("c", list(range(100)), None, mm_features=media)
+    for request, expected in ((prefix_lm, 0), (causal, 10)):
+        scheduled = scheduler._try_schedule_encoder_inputs(request, 0, 100, 500)
+        assert scheduled == ([], expected, 500, [], [])
+
+
+def test_waiting_for_the_encoder_holds_no_cached_inputs():
+    """A PrefixLM prompt that waits for encoder budget must not keep cached
+    inputs from being evicted, or it and others can wait forever."""
+    scheduler = make_scheduler(budget=512)
+    scheduler.encoder_cache_manager = EncoderCacheManager(cache_size=160)
+    scheduler.max_num_encoder_input_tokens = 160
+
+    def run(*requests):
+        for request in requests:
+            scheduler.add_request(request)
+        output = scheduler.schedule()
+        ids = list(output.num_scheduled_tokens)
+        prefilled = [
+            [0]
+            if scheduler.requests[i].num_computed_tokens
+            >= len(scheduler.requests[i].prompt_token_ids)
+            else []
+            for i in ids
+        ]
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(ids, {i: n for n, i in enumerate(ids)}, prefilled),
+        )
+        return output.num_scheduled_tokens
+
+    # Images X and A end up cached and freeable.
+    run(make_request("x", list(range(40)), None, mm_features=[image("X", 0, 32)]))
+    run(make_request("a", list(range(50, 90)), None, mm_features=[image("A", 0, 32)]))
+    # A running prompt takes most of the next step's encoder budget.
+    run(
+        make_request(
+            "g", list(range(100, 700)), None, mm_features=[image("G", 520, 64)]
+        )
+    )
+    r0 = make_request(
+        "r0",
+        list(range(1000, 1200)),
+        150,
+        mm_features=[image("X", 0, 32), image("Y", 40, 100)],
+    )
+    r1 = make_request(
+        "r1",
+        list(range(2000, 2200)),
+        150,
+        mm_features=[image("A", 0, 32), image("B", 40, 100)],
+    )
+    scheduled = set()
+    for i in range(5):
+        scheduled |= set(run(*([r0, r1] if i == 0 else [])))
+        if i == 0:
+            # Both wait for the encoder, holding no references to X or A.
+            assert not scheduled & {"r0", "r1"}
+            assert not scheduler.encoder_cache_manager.cached["X"]
+            assert not scheduler.encoder_cache_manager.cached["A"]
+    assert {"r0", "r1"} <= scheduled
 
 
 def test_needs_mamba_align_mode():
