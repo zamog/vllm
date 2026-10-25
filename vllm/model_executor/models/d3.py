@@ -86,7 +86,7 @@ class D3PrefixBidirModelState(MambaHybridModelState):
         params = new_req_data.pooling_params
         state = (params.extra_kwargs or {}).get(STATE_TOKENS) if params else None
         length = len(new_req_data.prompt_token_ids or ())
-        if isinstance(state, int) and 0 < state < length:
+        if type(state) is int and 0 < state < length:
             blocks = [(0, state - 1), (state, length - 1)]
         else:
             # Without a state block size (warm-up runs, or a request that did

@@ -39,6 +39,7 @@ def test_keeps_the_hybrid_model_state() -> None:
         (None, False, [(0, 9)]),  # no pooling params
         (10, True, [(0, 9)]),  # a state-only prompt
         (0, True, [(0, 9)]),
+        (True, True, [(0, 9)]),  # a bool is not a token count
     ],
 )
 def test_state_and_question_blocks(
