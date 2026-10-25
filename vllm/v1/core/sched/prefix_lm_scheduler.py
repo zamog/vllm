@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Prefix caching for PrefixLM requests, which send their prefix length in
-`extra_args["prefix_lm_len"]`: salts each prefix's blocks by its digest, as the KV
-of every prefix token depends on the whole prefix, caps hits at the prefix and
-prefills the rest of the prompt in one step."""
+`SamplingParams.extra_args["prefix_lm_len"]` or
+`PoolingParams.extra_kwargs["prefix_lm_len"]`: salts each prefix's blocks by
+its digest, as the KV of every prefix token depends on the whole prefix, caps
+hits at the prefix and prefills the rest of the prompt in one step."""
 
 import copy
 import hashlib
@@ -13,6 +14,7 @@ import numpy as np
 
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -22,18 +24,28 @@ from vllm.v1.request import Request
 logger = init_logger(__name__)
 
 PREFIX_LM_LEN = "prefix_lm_len"
-"""`SamplingParams.extra_args` key of the length of a prompt's PrefixLM prefix."""
+"""`SamplingParams.extra_args` or `PoolingParams.extra_kwargs` key of the length
+of a prompt's PrefixLM prefix."""
 
 PREFIX_LM_SALT = "prefix-lm:"
 """Start of the `cache_salt` of every PrefixLM request, and of no other."""
 
 
+def _extra(params: SamplingParams | PoolingParams | None) -> dict | None:
+    if isinstance(params, SamplingParams):
+        return params.extra_args
+    if isinstance(params, PoolingParams):
+        return params.extra_kwargs
+    return None
+
+
 def prefix_lm_len(
-    params: SamplingParams | None, prompt_token_ids: Sequence[int] | None
+    params: SamplingParams | PoolingParams | None,
+    prompt_token_ids: Sequence[int] | None,
 ) -> int | None:
     """The valid PrefixLM prefix length a request sends, else None."""
-    extra_args = params.extra_args if params is not None else None
-    prefix_len = extra_args.get(PREFIX_LM_LEN) if extra_args else None
+    extra = _extra(params)
+    prefix_len = extra.get(PREFIX_LM_LEN) if extra else None
     if (
         type(prefix_len) is int
         and prompt_token_ids is not None
@@ -71,8 +83,26 @@ def _straddles(features: Sequence[MultiModalFeatureSpec], position: int) -> bool
     )
 
 
+def _request_params(request: Request) -> SamplingParams | PoolingParams | None:
+    return request.sampling_params or request.pooling_params
+
+
 def _request_prefix_lm_len(request: Request) -> int | None:
-    return prefix_lm_len(request.sampling_params, request.prompt_token_ids)
+    return prefix_lm_len(_request_params(request), request.prompt_token_ids)
+
+
+def _drop_prefix_lm_len(request: Request) -> None:
+    """Remove the prefix length from a copy of the request's params."""
+    params = copy.copy(_request_params(request))
+    if isinstance(params, SamplingParams):
+        params.extra_args = dict(params.extra_args or {})
+        del params.extra_args[PREFIX_LM_LEN]
+        request.sampling_params = params
+    else:
+        assert isinstance(params, PoolingParams)
+        params.extra_kwargs = dict(params.extra_kwargs or {})
+        del params.extra_kwargs[PREFIX_LM_LEN]
+        request.pooling_params = params
 
 
 class PrefixLMScheduler(Scheduler):
@@ -97,7 +127,6 @@ class PrefixLMScheduler(Scheduler):
             )
 
     def add_request(self, request: Request) -> None:
-        params = request.sampling_params
         prefix_len = _request_prefix_lm_len(request)
         if prefix_len is not None and (
             request.resumable or _straddles(request.mm_features, prefix_len)
@@ -109,10 +138,7 @@ class PrefixLMScheduler(Scheduler):
                 "prefix end ignore %s",
                 PREFIX_LM_LEN,
             )
-            assert params is not None
-            request.sampling_params = params = copy.copy(params)
-            params.extra_args = dict(params.extra_args or {})
-            del params.extra_args[PREFIX_LM_LEN]
+            _drop_prefix_lm_len(request)
         # A streaming update re-adds an existing request.
         if request.request_id not in self.requests:
             self._salt_by_kind(request)

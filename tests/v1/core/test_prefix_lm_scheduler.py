@@ -11,6 +11,7 @@ import torch
 from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.platforms import current_platform
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
@@ -25,7 +26,7 @@ from vllm.v1.core.sched.prefix_lm_scheduler import (
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 from .utils import EOS_TOKEN_ID, create_scheduler
 
@@ -63,7 +64,13 @@ def image(identifier: str, offset: int, length: int) -> MultiModalFeatureSpec:
 
 
 def make_request(
-    req_id, prompt, prefix_len, salt="own", resumable=False, mm_features=None
+    req_id,
+    prompt,
+    prefix_len,
+    salt="own",
+    resumable=False,
+    mm_features=None,
+    pooling=False,
 ):
     """A PrefixLM request with the strategy's salt, or causal if prefix_len is None."""
     if salt == "own":
@@ -73,14 +80,18 @@ def make_request(
             else prefix_lm_salt(prompt[:prefix_len], None, mm_features or ())
         )
     extra_args = None if prefix_len is None else {PREFIX_LM_LEN: prefix_len}
-    params = SamplingParams(max_tokens=1, extra_args=extra_args)
-    params.update_from_generation_config({}, EOS_TOKEN_ID)
+    sampling_params, pooling_params = None, None
+    if pooling:
+        pooling_params = PoolingParams(task="classify", extra_kwargs=extra_args)
+    else:
+        sampling_params = SamplingParams(max_tokens=1, extra_args=extra_args)
+        sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
     init_none_hash(sha256)
     return Request(
         request_id=req_id,
         prompt_token_ids=prompt,
-        sampling_params=params,
-        pooling_params=None,
+        sampling_params=sampling_params,
+        pooling_params=pooling_params,
         cache_salt=salt,
         resumable=resumable,
         mm_features=mm_features,
@@ -127,6 +138,35 @@ def test_hits_stop_at_the_prefix_and_prompts_prefill_whole(cls):
     assert step(
         scheduler, make_request("p48", q1, 48), make_request("causal", q1, None)
     ) == {"p48": (0, 70), "causal": (0, 70)}
+
+
+def test_pooling_requests_send_their_prefix_in_extra_kwargs():
+    """A pooling request's prefix length comes from its extra_kwargs: its
+    hits stop at the prefix like a sampling request's."""
+    scheduler = make_scheduler()
+    prefix = list(range(100, 140))
+    q1, q2 = (prefix + [i] * 30 for i in (1, 2))
+
+    def run(request: Request) -> tuple[int, int]:
+        scheduler.add_request(request)
+        output = scheduler.schedule()
+        scheduled = output.num_scheduled_tokens[request.request_id]
+        scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_STOPPED)
+        return request.num_computed_tokens - scheduled, scheduled
+
+    assert run(make_request("prefix", prefix, 40, pooling=True)) == (0, 40)
+    assert run(make_request("q1", q1, 40, pooling=True)) == (32, 38)
+    # The same prompt as a sampling request has the same salt and hits too.
+    assert run(make_request("q2", q2, 40)) == (32, 38)
+    assert make_request("q", q1, 40, pooling=True).cache_salt == prefix_lm_salt(
+        prefix, None
+    )
+    # The prefix length can be dropped from pooling params too.
+    across = make_request(
+        "across", q1, 40, salt=None, mm_features=[image("a", 30, 20)], pooling=True
+    )
+    scheduler.add_request(across)
+    assert PREFIX_LM_LEN not in across.pooling_params.extra_kwargs
 
 
 def test_prompt_one_token_over_budget_waits():
