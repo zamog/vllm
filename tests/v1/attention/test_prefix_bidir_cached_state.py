@@ -54,7 +54,7 @@ def _requests(block: int) -> list[tuple[int, int, int]]:
     ]
 
 
-def _backend_config(backend: AttentionBackendEnum, block: int):
+def _backend_config(backend: AttentionBackendEnum, block: int, version: int | None):
     # The FlashAttention builder fills the ranges only for PrefixLM models,
     # as the Decision 3.0 prefix_bidir model is.
     vllm_config = _enable_mm_prefix(
@@ -71,7 +71,7 @@ def _backend_config(backend: AttentionBackendEnum, block: int):
     mc.get_num_attention_heads = MethodType(lambda self, _=None: NUM_HEADS, mc)
     mc.get_num_kv_heads = MethodType(lambda self, _=None: NUM_KV_HEADS, mc)
     if backend == AttentionBackendEnum.FLASH_ATTN:
-        vllm_config.attention_config.flash_attn_version = 4
+        vllm_config.attention_config.flash_attn_version = version
     return vllm_config
 
 
@@ -79,12 +79,13 @@ def run_prefix_bidir(
     backend: AttentionBackendEnum,
     block: int,
     requests: list[tuple[int, int, int]],
+    version: int | None = 4,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
     """Per request: the backend's output rows, the dense reference and a
     causal-only reference, for ``requests`` of (state tokens, question
     tokens, cached tokens)."""
     torch.manual_seed(0)
-    vllm_config = _backend_config(backend, block)
+    vllm_config = _backend_config(backend, block, version)
     seq_lens = [s + q for s, q, _ in requests]
     query_lens = [s + q - c for s, q, c in requests]
     ranges = {i: [(0, s - 1), (s, s + q - 1)] for i, (s, q, _) in enumerate(requests)}
@@ -150,24 +151,28 @@ def run_prefix_bidir(
 
 
 @pytest.mark.parametrize(
-    "backend,block",
+    "backend,version,block",
     [
-        # H200: FlashAttention 4 with FlashInfer GDN's 832-token blocks.
-        pytest.param(AttentionBackendEnum.FLASH_ATTN, 832, id="fa4-832"),
-        # A100: Triton with Triton/FLA GDN's 784-token blocks.
-        pytest.param(AttentionBackendEnum.TRITON_ATTN, 784, id="triton-784"),
+        # H200: FlashAttention 4 (mask hook) with FlashInfer GDN's 832-token
+        # blocks, and FlashAttention 3 (virtual sequences).
+        pytest.param(AttentionBackendEnum.FLASH_ATTN, 4, 832, id="fa4-832"),
+        pytest.param(AttentionBackendEnum.FLASH_ATTN, 3, 832, id="fa3-832"),
+        # A100: FlashAttention 2 (virtual sequences) and Triton with Triton/FLA
+        # GDN's 784-token blocks.
+        pytest.param(AttentionBackendEnum.FLASH_ATTN, 2, 784, id="fa2-784"),
+        pytest.param(AttentionBackendEnum.TRITON_ATTN, None, 784, id="triton-784"),
     ],
 )
-def test_question_over_cached_state_matches_whole_prompt(backend, block):
+def test_question_over_cached_state_matches_whole_prompt(backend, version, block):
     if backend == AttentionBackendEnum.FLASH_ATTN:
         from vllm.v1.attention.backends.fa_utils import is_fa_version_supported
 
-        if not (
-            current_platform.is_device_capability_family(90)
-            and is_fa_version_supported(4)
-        ):
-            pytest.skip("FlashAttention 4 on Hopper")
-    actual, expected, causal = run_prefix_bidir(backend, block, _requests(block))
+        hopper = current_platform.is_device_capability_family(90)
+        if not is_fa_version_supported(version) or (version in (3, 4) and not hopper):
+            pytest.skip(f"FlashAttention {version} on this GPU")
+    actual, expected, causal = run_prefix_bidir(
+        backend, block, _requests(block), version
+    )
     for i, (got, want, causal_only) in enumerate(zip(actual, expected, causal)):
         torch.testing.assert_close(
             got, want, atol=2e-2, rtol=2e-2, msg=lambda m, i=i: f"request {i}: {m}"

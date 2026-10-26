@@ -33,9 +33,11 @@ from vllm.v1.attention.backends.fa_utils import (
     uses_fa4_hd256_kernel,
 )
 from vllm.v1.attention.backends.utils import (
+    MMPrefixSegments,
     fill_mm_prefix_query_ranges,
     get_dcp_local_seq_lens,
     get_num_attention_heads_from_layers,
+    split_mm_prefix_segments,
 )
 from vllm.v1.attention.ops.dcp import (
     cp_lse_ag_out_rs,
@@ -505,13 +507,58 @@ class FlashAttentionBackend(AttentionBackend):
                 supports_fa4_hd256=True,
             )
             != 4
+            and not _mm_prefix_as_segments_supported()
         ):
             return (
-                "mm_prefix (PrefixLM bidirectional attention) requires "
-                "FlashAttention v4, which does not resolve for this "
-                "head_size"
+                "mm_prefix (PrefixLM bidirectional attention) with sliding-window "
+                "attention requires FlashAttention v4, which does not resolve for "
+                "this head_size"
             )
         return None
+
+
+def _mm_prefix_as_segments_supported() -> bool:
+    """Whether FlashAttention 2/3 can read the model's PrefixLM ranges as
+    virtual sequences: every query row's keys must be a prefix of its sequence,
+    which a sliding window breaks."""
+    vllm_config = get_current_vllm_config_or_none()
+    return (
+        vllm_config is not None
+        and vllm_config.model_config.get_sliding_window() is None
+    )
+
+
+@dataclass
+class MMPrefixSegmentTensors:
+    """`MMPrefixSegments` on the device, for one FlashAttention 2/3 call."""
+
+    rows: torch.Tensor | None
+    req_idx: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    seqused_k: torch.Tensor
+    max_seqlen_q: int
+    max_seqlen_k: int
+
+    @classmethod
+    def from_segments(
+        cls, segments: MMPrefixSegments | None, device: torch.device
+    ) -> "MMPrefixSegmentTensors | None":
+        if segments is None:
+            return None
+
+        def to_device(array: np.ndarray, dtype: torch.dtype) -> torch.Tensor:
+            return torch.from_numpy(array).to(device=device, dtype=dtype)
+
+        return cls(
+            rows=None
+            if segments.rows is None
+            else to_device(segments.rows, torch.long),
+            req_idx=to_device(segments.req_idx, torch.long),
+            cu_seqlens_q=to_device(segments.cu_seqlens_q, torch.int32),
+            seqused_k=to_device(segments.seqused_k, torch.int32),
+            max_seqlen_q=segments.max_seqlen_q,
+            max_seqlen_k=segments.max_seqlen_k,
+        )
 
 
 @dataclass
@@ -553,6 +600,10 @@ class FlashAttentionMetadata:
     # Shape: (num_actual_tokens, 2) int32, absolute [start, end] bounds;
     # (-1, -1) for query tokens outside every multimodal range.
     mm_prefix_query_range_tensor: torch.Tensor | None = None
+    # FlashAttention 2/3: the batch as (non-causal, causal) virtual sequences
+    # that read the PrefixLM ranges (`split_mm_prefix_segments`); None when no
+    # range covers a scheduled query token.
+    mm_prefix_segments: "tuple[MMPrefixSegmentTensors | None, ...] | None" = None
 
     # Reference Sliding Window Attention (R-SWA) fields.
     # rswa_prefix_lens:  per-request prompt lengths [num_reqs], int32, CUDA.
@@ -713,6 +764,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             kv_cache_block_size=self.block_size,
             supports_fa4_hd256=True,
         )
+        self.fa_version = fa_version
         self.fa4_hd256 = fa_version == 4 and uses_fa4_hd256_kernel(
             self.headdim, head_size_v
         )
@@ -980,7 +1032,25 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         # multimodal tokens with bidirectional ranges.  Built for every FA
         # group; Gemma4 nulls the field for its non-sliding layers.
         mm_ranges = common_attn_metadata.mm_req_doc_ranges
-        if mm_ranges is not None and self.mm_prefix_query_ranges_np is not None:
+        if (
+            mm_ranges is not None
+            and self.mm_prefix_query_ranges_np is not None
+            and self.fa_version != 4
+        ):
+            # FlashAttention 2/3 have no mask hook: read the ranges as virtual
+            # sequences instead.
+            assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
+            split = split_mm_prefix_segments(
+                mm_ranges,
+                common_attn_metadata.query_start_loc_cpu,
+                common_attn_metadata.seq_lens_cpu_upper_bound,
+            )
+            if split is not None:
+                attn_metadata.mm_prefix_segments = tuple(
+                    MMPrefixSegmentTensors.from_segments(group, self.device)
+                    for group in split
+                )
+        elif mm_ranges is not None and self.mm_prefix_query_ranges_np is not None:
             # The upper bound is exact for prefill rows, which is where
             # mm_prefix ranges live; decode rows only ever get an optimistic
             # (larger) context, moving them further past every range.
@@ -1309,6 +1379,16 @@ class FlashAttentionImpl(AttentionImpl):
                 v_descale=v_descale,
             )
             return output
+        elif attn_metadata.mm_prefix_segments is not None:
+            self._forward_mm_prefix_segments(
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                output[:num_actual_tokens],
+                attn_metadata,
+                layer,
+            )
+            return output
         else:
             causal = attn_metadata.causal
             is_dynamic_causal = isinstance(causal, torch.Tensor)
@@ -1428,6 +1508,60 @@ class FlashAttentionImpl(AttentionImpl):
                 aux_tensors=rswa_aux or mm_aux,
             )
             return output
+
+    def _forward_mm_prefix_segments(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        layer: torch.nn.Module,
+    ) -> None:
+        """PrefixLM attention on FlashAttention 2/3: one non-causal call over
+        the rows inside ranges and one causal call over the rest, each a varlen
+        batch of virtual sequences that read their request's KV cache."""
+        assert attn_metadata.mm_prefix_segments is not None
+        if self.sliding_window != (-1, -1):
+            raise NotImplementedError(
+                "PrefixLM ranges on FlashAttention 2/3 need full attention; "
+                "sliding-window layers need FlashAttention 4 or Triton"
+            )
+        for segments, causal in zip(attn_metadata.mm_prefix_segments, (False, True)):
+            if segments is None:
+                continue
+            if segments.rows is None:
+                q, out = query, output
+            else:
+                q = query.index_select(0, segments.rows)
+                out = torch.empty_like(q)
+            descale_shape = (segments.req_idx.shape[0], self.num_kv_heads)
+            flash_attn_varlen_func(
+                q=q,
+                k=key_cache,
+                v=value_cache,
+                out=out,
+                cu_seqlens_q=segments.cu_seqlens_q,
+                max_seqlen_q=segments.max_seqlen_q,
+                seqused_k=segments.seqused_k,
+                max_seqlen_k=segments.max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=causal,
+                alibi_slopes=self.alibi_slopes,
+                block_table=attn_metadata.block_table.index_select(0, segments.req_idx),
+                softcap=self.logits_soft_cap,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=(
+                    layer._q_scale.expand(descale_shape)
+                    if self.supports_quant_query_input
+                    else None
+                ),
+                k_descale=layer._k_scale.expand(descale_shape),
+                v_descale=layer._v_scale.expand(descale_shape),
+                s_aux=self.sinks,
+            )
+            if segments.rows is not None:
+                output.index_copy_(0, segments.rows, out)
 
     def do_kv_cache_update(
         self,
