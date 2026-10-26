@@ -75,6 +75,15 @@ def test_mixed_batch_and_decode_rows():
     )
     assert segments(causal) == [(0, 0, 6, 6), (1, 6, 1, 40)]
     assert segments(non_causal) == [(2, 7, 8, 8), (2, 15, 2, 10)]
+    # Causal segments ending at their request's end take the device's exact
+    # sequence length (a decode row's CPU length is an upper bound).
+    assert causal.ends_at_seq_len.tolist() == [True, True]
+    assert not non_causal.ends_at_seq_len.any()
+
+
+def test_causal_rows_before_a_range_keep_their_key_count():
+    _, causal = split({0: [(10, 19)]}, [30], [30])
+    assert causal.ends_at_seq_len.tolist() == [False, True]
 
 
 def test_range_past_the_computed_tokens():

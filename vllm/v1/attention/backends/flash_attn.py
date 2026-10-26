@@ -448,7 +448,11 @@ class FlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_mm_prefix(cls) -> bool:
-        return is_fa_version_supported(4)
+        # FlashAttention 2/3 read the ranges as virtual sequences when the
+        # model has no sliding window (see supports_combination).
+        return is_fa_version_supported(4) or (
+            is_flash_attn_varlen_func_available() and _mm_prefix_as_segments_supported()
+        )
 
     @classmethod
     def supports_sink(cls) -> bool:
@@ -541,21 +545,35 @@ class MMPrefixSegmentTensors:
 
     @classmethod
     def from_segments(
-        cls, segments: MMPrefixSegments | None, device: torch.device
+        cls,
+        segments: MMPrefixSegments | None,
+        seq_lens: torch.Tensor,
+        device: torch.device,
     ) -> "MMPrefixSegmentTensors | None":
+        """``seq_lens``: the batch's exact per-request sequence lengths on the
+        device, used by causal segments that end at their request's end
+        (decode rows' CPU lengths are only upper bounds)."""
         if segments is None:
             return None
 
         def to_device(array: np.ndarray, dtype: torch.dtype) -> torch.Tensor:
             return torch.from_numpy(array).to(device=device, dtype=dtype)
 
+        req_idx = to_device(segments.req_idx, torch.long)
+        seqused_k = to_device(segments.seqused_k, torch.int32)
+        if segments.ends_at_seq_len.any():
+            seqused_k = torch.where(
+                to_device(segments.ends_at_seq_len, torch.bool),
+                seq_lens.index_select(0, req_idx).to(torch.int32),
+                seqused_k,
+            )
         return cls(
             rows=None
             if segments.rows is None
             else to_device(segments.rows, torch.long),
-            req_idx=to_device(segments.req_idx, torch.long),
+            req_idx=req_idx,
             cu_seqlens_q=to_device(segments.cu_seqlens_q, torch.int32),
-            seqused_k=to_device(segments.seqused_k, torch.int32),
+            seqused_k=seqused_k,
             max_seqlen_q=segments.max_seqlen_q,
             max_seqlen_k=segments.max_seqlen_k,
         )
@@ -1047,7 +1065,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             )
             if split is not None:
                 attn_metadata.mm_prefix_segments = tuple(
-                    MMPrefixSegmentTensors.from_segments(group, self.device)
+                    MMPrefixSegmentTensors.from_segments(
+                        group, common_attn_metadata.seq_lens, self.device
+                    )
                     for group in split
                 )
         elif mm_ranges is not None and self.mm_prefix_query_ranges_np is not None:

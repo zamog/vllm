@@ -220,6 +220,10 @@ class MMPrefixSegments:
     cu_seqlens_q: np.ndarray
     #: Keys each segment reads: every key before this.
     seqused_k: np.ndarray
+    #: Whether a causal segment ends at its request's last token, so its key
+    #: count is the request's sequence length (exact only on the device for
+    #: decode rows; the CPU value is an upper bound).
+    ends_at_seq_len: np.ndarray
     max_seqlen_q: int
     max_seqlen_k: int
 
@@ -284,6 +288,7 @@ def split_mm_prefix_segments(
             )
             pos = last + 1
         if pos < seq_len:
+            # Causal rows after the last range; they end at the sequence end.
             segments[1].append(
                 (req_idx, token_start + pos - context, seq_len - pos, seq_len)
             )
@@ -305,12 +310,18 @@ def split_mm_prefix_segments(
         identity = len(rows) == num_tokens and bool(
             (rows == np.arange(num_tokens)).all()
         )
+        seqused_k = np.array([s[3] for s in group], dtype=np.int32)
         out.append(
             MMPrefixSegments(
                 rows=None if identity else rows,
                 req_idx=req,
                 cu_seqlens_q=cu,
-                seqused_k=np.array([s[3] for s in group], dtype=np.int32),
+                seqused_k=seqused_k,
+                ends_at_seq_len=(
+                    seqused_k == seq_lens[req]
+                    if group is segments[1]
+                    else np.zeros(len(group), dtype=bool)
+                ),
                 max_seqlen_q=int(lens.max()),
                 max_seqlen_k=max(s[3] for s in group),
             )
