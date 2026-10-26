@@ -160,9 +160,12 @@ class PrefixLMScheduler(Scheduler):
             self._salt_by_kind(request)
             prefix_len = self._prefix_lm_len(request)
             if prefix_len is not None:
-                # KV past the prefix depends on the rest of the prompt; KV
-                # connectors (CPU offloading) read the same cap.
-                request.max_cache_hit_length = prefix_len
+                # KV past the prefix depends on the rest of the prompt, and the
+                # last token is always computed for its output. KV connectors
+                # (CPU offloading) read the same cap.
+                request.max_cache_hit_length = min(
+                    prefix_len, len(request.prompt_token_ids or ()) - 1
+                )
         super().add_request(request)
 
     def _salt_by_kind(self, request: Request) -> None:
@@ -188,14 +191,11 @@ class PrefixLMScheduler(Scheduler):
     def _get_local_prefix_cache_hit(
         self, request: Request, max_cache_hit_length: int | None = None
     ) -> tuple[KVCacheBlocks, int, int, bool]:
-        prefix_len = self._prefix_lm_len(request)
-        if prefix_len is not None:
-            # KV past the prefix depends on the rest of the prompt. The last
-            # token is always computed to get its logits.
-            prefix_len = min(prefix_len, request.num_tokens - 1)
-            if max_cache_hit_length is not None:
-                prefix_len = min(prefix_len, max_cache_hit_length)
-            max_cache_hit_length = prefix_len
+        cap = request.max_cache_hit_length  # set in add_request
+        if cap is not None:
+            max_cache_hit_length = (
+                cap if max_cache_hit_length is None else min(cap, max_cache_hit_length)
+            )
         return super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
 
     def _try_schedule_encoder_inputs(

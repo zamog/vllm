@@ -1272,7 +1272,9 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
         unsupported = {
             "KV transfer connectors": vllm_config.kv_transfer_config,
             # CPU offloading of state blocks: the native OffloadingConnector
-            # honors the per-request hit cap the scheduler sets.
+            # honors the per-request hit cap the scheduler sets, and its hits
+            # are whole chunks of Mamba blocks (block size = Mamba block size
+            # here), so a loaded hit ends on a saved Gated DeltaNet state.
             "--kv-offloading-backend other than native": (
                 cache_config.kv_offloading_size is not None
                 and (

@@ -227,7 +227,10 @@ def test_an_async_kv_load_step_is_not_a_split(monkeypatch):
     [
         (PrefixLMScheduler, 40, 40),
         (PrefixLMScheduler, None, None),
-        (BidirectionalPrefixLMScheduler, None, 70),
+        # A whole-prompt prefix: the last token is always computed, so no
+        # cache, local or loaded, may cover it.
+        (PrefixLMScheduler, 70, 69),
+        (BidirectionalPrefixLMScheduler, None, 69),
     ],
 )
 def test_prefix_requests_cap_every_cache_hit(cls, prefix_len, cap):
