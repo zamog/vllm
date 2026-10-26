@@ -768,13 +768,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         return (
             self._checkpoint_alignment is not None
             and get_mamba_prefill_checkpoint_alignment(self.vllm_config) is not None
-            and (
-                self.gdn_prefill_backend == "flashinfer"
-                # Split rows are validated only with checkpoints on block
-                # boundaries.
-                or self.cache_config.prefix_match_unit
-                in (None, self.cache_config.block_size)
-            )
         )
 
     @functools.cached_property

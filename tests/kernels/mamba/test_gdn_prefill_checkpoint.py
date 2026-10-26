@@ -67,18 +67,33 @@ PREFIX = "model.layers.0.linear_attn"
 PREFILLS = [(32, 87), (0, 50), (37, 20)]
 HEAD_LENS = [80, 48]  # query tokens before each checkpoint
 
+# Hits every 16 tokens of a 64-token Mamba block: checkpoints at token 144,
+# mid-block, from a block boundary and from a hit inside a block.
+FINE_BLOCK_SIZE = 64
+FINE_PREFILLS = [(32, 120), (0, 150), (37, 20)]
+FINE_HEAD_LENS = [112, 144]
 
-def _make_vllm_config(backend: str):
+LAYOUTS = {
+    "hash=block": (BLOCK_SIZE, BLOCK_SIZE, PREFILLS, HEAD_LENS),
+    "hash<block": (FINE_BLOCK_SIZE, BLOCK_SIZE, FINE_PREFILLS, FINE_HEAD_LENS),
+}
+
+
+def _make_vllm_config(
+    backend: str, block_size: int = BLOCK_SIZE, hash_block_size: int = BLOCK_SIZE
+):
     cfg = create_vllm_config(
         model_name="Qwen/Qwen3.5-0.8B",
-        block_size=BLOCK_SIZE,
+        block_size=block_size,
         hf_config_override={"linear_key_head_dim": K},
     )
     cfg.additional_config = {"gdn_prefill_backend": backend}
     cfg.cache_config.mamba_cache_mode = "align"
-    cfg.cache_config.mamba_block_size = BLOCK_SIZE
-    cfg.cache_config.hash_block_size = BLOCK_SIZE
-    cfg.cache_config.cache_hit_alignment_tokens = BLOCK_SIZE
+    cfg.cache_config.mamba_block_size = block_size
+    if hash_block_size != block_size:
+        cfg.cache_config.prefix_match_unit = hash_block_size
+    cfg.cache_config.hash_block_size = hash_block_size
+    cfg.cache_config.cache_hit_alignment_tokens = hash_block_size
     return cfg
 
 
@@ -130,7 +145,7 @@ def _make_builder(vllm_config, layer, device, checkpoints: bool):
 def _build(builder, vllm_config, seq_lens, query_lens, device):
     common = create_common_attn_metadata(
         BatchSpec(seq_lens=seq_lens, query_lens=query_lens),
-        BLOCK_SIZE,
+        vllm_config.cache_config.mamba_block_size,
         device,
         arange_block_indices=True,
     )
@@ -162,17 +177,19 @@ def _random_pools(pool_size, state_dtype, device):
 @pytest.mark.parametrize("backend", ["triton", "aiter_flydsl"])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("num_decodes", [0, 1])
+@pytest.mark.parametrize("layout", list(LAYOUTS))
 def test_split_prefill_checkpoint(
-    backend: str, state_dtype: torch.dtype, num_decodes: int
+    backend: str, state_dtype: torch.dtype, num_decodes: int, layout: str
 ) -> None:
     if (
         backend == "aiter_flydsl"
         and not rocm_aiter_ops.is_gdn_flydsl_prefill_available()
     ):
         pytest.skip("AITER FlyDSL GDN prefill is not available")
+    block_size, hash_block_size, prefills, head_lens = LAYOUTS[layout]
     torch.manual_seed(0)
     device = torch.device("cuda")
-    vllm_config = _make_vllm_config(backend)
+    vllm_config = _make_vllm_config(backend, block_size, hash_block_size)
 
     conv_weight = torch.randn(CONV_DIM, 1, CONV_KERNEL, device=device).bfloat16()
     weights = dict(
@@ -186,15 +203,15 @@ def test_split_prefill_checkpoint(
     )
     layer = _make_layer(vllm_config, backend, weights)
 
-    seq_lens = [64] * num_decodes + [ctx + query for ctx, query in PREFILLS]
-    query_lens = [1] * num_decodes + [query for _, query in PREFILLS]
+    seq_lens = [64] * num_decodes + [ctx + query for ctx, query in prefills]
+    query_lens = [1] * num_decodes + [query for _, query in prefills]
     ckpt_builder = _make_builder(vllm_config, layer, device, checkpoints=True)
     plain_builder = _make_builder(vllm_config, layer, device, checkpoints=False)
     assert ckpt_builder.gdn_prefill_backend == backend
     meta, pool_size = _build(ckpt_builder, vllm_config, seq_lens, query_lens, device)
     plain_meta, _ = _build(plain_builder, vllm_config, seq_lens, query_lens, device)
     assert meta.checkpoint is not None and meta.checkpoint_split is not None
-    assert meta.checkpoint.offsets == [0] * num_decodes + HEAD_LENS + [0]
+    assert meta.checkpoint.offsets == [0] * num_decodes + head_lens + [0]
     assert plain_meta.checkpoint is None
 
     num_tokens = sum(query_lens)
@@ -230,16 +247,16 @@ def test_split_prefill_checkpoint(
 
     # Reference: the checkpointed prefills stopping at their checkpoints, from
     # the same initial states, write the expected checkpoints to their slots.
-    rows = slice(num_decodes, num_decodes + len(HEAD_LENS))
-    starts = [num_decodes, num_decodes + PREFILLS[0][1]]
+    rows = slice(num_decodes, num_decodes + len(head_lens))
+    starts = [num_decodes, num_decodes + prefills[0][1]]
     head = torch.cat(
-        [torch.arange(s, s + n, device=device) for s, n in zip(starts, HEAD_LENS)]
+        [torch.arange(s, s + n, device=device) for s, n in zip(starts, head_lens)]
     )
     ref_meta, ref_pool_size = _build(
         plain_builder,
         vllm_config,
-        [ctx + n for (ctx, _), n in zip(PREFILLS, HEAD_LENS)],
-        HEAD_LENS,
+        [ctx + n for (ctx, _), n in zip(prefills, head_lens)],
+        head_lens,
         device,
     )
     ref_slots = ref_meta.non_spec_state_indices_tensor.long()
