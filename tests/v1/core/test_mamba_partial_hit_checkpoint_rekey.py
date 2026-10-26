@@ -253,6 +253,12 @@ def test_partial_hit_then_checkpointed_chunk_does_not_rekey_cow_block() -> None:
     assert (PROMPT_B - 1) // MAMBA_BLOCK_SIZE - (hit_b - 1) // MAMBA_BLOCK_SIZE >= 2
 
     _assert_cached_mamba_slots_hold_claimed_state(manager, req_b, state_at)
+    # A decode step's caching would key the same block: the flag outlives
+    # the prompt.
+    req_b.append_output_token_ids(7)
+    req_b.num_computed_tokens = PROMPT_B + 1
+    manager.cache_blocks(req_b, PROMPT_B + 1)
+    _assert_cached_mamba_slots_hold_claimed_state(manager, req_b, state_at)
 
     # The user-visible consequence: C's Mamba hit block must hold the state
     # the hit length promises.
