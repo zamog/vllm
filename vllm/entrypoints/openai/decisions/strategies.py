@@ -1377,12 +1377,12 @@ class D3Strategy(ReadStrategy):
         they reuse it from the prefix cache.
 
         With prefix caching, a question's hit stops at its state block and at
-        the last Gated DeltaNet state saved there, c: a prompt of s tokens
-        prefilled from 0 in one step saves its state at its last multiple of
-        the prefix match unit before s (or of the Mamba block without one),
-        if that falls in an earlier Mamba block than s. The state block alone
-        saves it nearest s; a question would save it past s, in its own
-        tokens. Prompts prefilled together reuse nothing of each other."""
+        the last Gated DeltaNet state saved there, c: a prompt prefilled from
+        0 in one step saves the state at the last multiple of the prefix match
+        unit (or of the Mamba block without one) within its state block of s
+        tokens, if the prompt is longer than one Mamba block.
+        Prompts prefilled together reuse nothing of each other, so the state
+        block goes first, alone: the shortest prompt that saves it."""
         cache_config = self.context.engine_client.vllm_config.cache_config
         block = cache_config.mamba_block_size
         if (
