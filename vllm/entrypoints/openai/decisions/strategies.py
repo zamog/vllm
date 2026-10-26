@@ -1389,9 +1389,15 @@ class D3Strategy(ReadStrategy):
             or not cache_config.enable_prefix_caching
             or not block
             or len(prompt_ids) < 2
-            or len(set(state_tokens)) != 1
-            or state_tokens[0] <= block
         ):
+            return None
+        if len(set(state_tokens)) != 1 or state_tokens[0] <= block:
+            logger.debug(
+                "Not prefilling a state block first: state blocks of %s tokens, "
+                "Mamba block %d",
+                sorted(set(state_tokens)),
+                block,
+            )
             return None
         last_boundary = (state_tokens[0] - 1) // block * block
         shortest = min(range(len(prompt_ids)), key=lambda n: len(prompt_ids[n]))

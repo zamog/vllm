@@ -1277,6 +1277,9 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
                 or vllm_config.parallel_config.decode_context_parallel_size > 1
             ),
             "micro-batching": vllm_config.parallel_config.use_ubatching,
+            # Hits finer than a Mamba block would never land on a saved
+            # Gated DeltaNet state; D3Strategy also counts on the hit being
+            # the state's last Mamba block boundary.
             "--prefix-match-unit": cache_config.prefix_match_unit,
             "--scheduler-cls": scheduler_config.scheduler_cls
             not in (None, *schedulers),
