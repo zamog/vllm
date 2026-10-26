@@ -99,6 +99,17 @@ def test_caches_state_blocks_when_asked():
     assert scheduler.max_num_batched_tokens == 65536
     assert scheduler.max_num_encoder_input_tokens == 65536
     assert scheduler.encoder_cache_size == 65536
+
+
+def test_sizes_the_encoder_budget_to_one_prompt():
+    """A larger step budget does not grow the encoder budget, whose startup
+    profiling would overflow the vision tower's int32 indexing."""
+    config = vllm_config(max_num_batched_tokens=393216, user_budget=True)
+    D3ForSequenceClassificationConfig.verify_and_update_config(config)
+    scheduler = config.scheduler_config
+    assert scheduler.max_num_batched_tokens == 393216
+    assert scheduler.max_num_encoder_input_tokens == 65536
+    assert scheduler.encoder_cache_size == 65536
     assert config.cache_config.mamba_ssm_cache_dtype == "float32"
 
 

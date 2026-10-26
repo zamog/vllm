@@ -1310,16 +1310,13 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
             scheduler_config.max_num_batched_tokens = max(
                 scheduler_config.max_num_batched_tokens, model_config.max_model_len
             )
-        # The encoder budgets were set from the token budget before it was
-        # raised; a prompt's media must fit one step with the prompt.
-        scheduler_config.max_num_encoder_input_tokens = max(
-            scheduler_config.max_num_encoder_input_tokens,
-            scheduler_config.max_num_batched_tokens,
-        )
-        scheduler_config.encoder_cache_size = max(
-            scheduler_config.encoder_cache_size,
-            scheduler_config.max_num_batched_tokens,
-        )
+        # A prompt is prefilled whole, so a step needs the media of one prompt,
+        # at most max_model_len tokens. Size the encoder budget to that, not to
+        # the token budget it was derived from: smaller, a prompt with much
+        # media would never fit; larger, the vision tower's startup profiling
+        # overflows int32 indexing (about 196K tokens and up on Qwen3.5).
+        scheduler_config.max_num_encoder_input_tokens = model_config.max_model_len
+        scheduler_config.encoder_cache_size = model_config.max_model_len
         budgets = {
             "--max-num-batched-tokens": scheduler_config.max_num_batched_tokens,
             "--max-num-scheduled-tokens": scheduler_config.max_num_scheduled_tokens,
