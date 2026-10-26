@@ -3278,6 +3278,36 @@ def test_validate_mamba_align_subblock_prefill():
 
 
 @pytest.mark.parametrize(
+    "scheduler_cls,allowed",
+    [
+        (None, False),
+        ("vllm.v1.core.sched.scheduler.Scheduler", False),
+        ("vllm.v1.core.sched.prefix_lm_scheduler.PrefixLMScheduler", True),
+        (
+            "vllm.v1.core.sched.prefix_lm_scheduler.BidirectionalPrefixLMScheduler",
+            True,
+        ),
+    ],
+)
+def test_mamba_align_without_chunked_mm_input(scheduler_cls, allowed):
+    """Align mode needs chunked multimodal input, unless the scheduler
+    prefills every prompt whole (the PrefixLM schedulers)."""
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=832, mamba_cache_mode="align"),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(
+            disable_chunked_mm_input=True, scheduler_cls=scheduler_cls
+        ),
+        kv_transfer_config=None,
+    )
+    if allowed:
+        VllmConfig.validate_block_size(config)
+    else:
+        with pytest.raises(AssertionError, match="Chunked MM input is required"):
+            VllmConfig.validate_block_size(config)
+
+
+@pytest.mark.parametrize(
     ("model_id", "compilation_config", "optimization_level"),
     [
         (

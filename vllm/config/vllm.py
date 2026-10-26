@@ -3421,8 +3421,14 @@ class VllmConfig:
                 "than or equal to and divisible by cp_kv_cache_interleave_size "
                 f"({self.parallel_config.cp_kv_cache_interleave_size})."
             )
-        # Mamba cache align-mode constraints
-        if self.cache_config.mamba_cache_mode == "align":
+        # Mamba cache align-mode constraints. The PrefixLM schedulers prefill
+        # every prompt whole from its cache hit, so they never stop inside a
+        # multimodal input.
+        scheduler_cls = getattr(self.scheduler_config, "scheduler_cls", None)
+        prefills_whole = isinstance(scheduler_cls, str) and scheduler_cls.startswith(
+            "vllm.v1.core.sched.prefix_lm_scheduler."
+        )
+        if self.cache_config.mamba_cache_mode == "align" and not prefills_whole:
             assert not self.scheduler_config.disable_chunked_mm_input, (
                 "Chunked MM input is required because we need the flexibility "
                 "to schedule a multiple of block_size tokens even if they are "
