@@ -51,6 +51,10 @@ def _requests(block: int) -> list[tuple[int, int, int]]:
         (block + 1, 40, block),
         # A state within its first block: nothing cached.
         (block - 100, 60, 0),
+        # Hits inside a block, at the state's last multiple of the prefix
+        # match unit: 64 (FlashInfer GDN), 16 (Triton/FLA GDN).
+        (3 * block + 300, 250, 3 * block + 256),
+        (block + 41, 30, block + 32),
     ]
 
 

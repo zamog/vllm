@@ -1288,10 +1288,11 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
                 or vllm_config.parallel_config.decode_context_parallel_size > 1
             ),
             "micro-batching": vllm_config.parallel_config.use_ubatching,
-            # Hits finer than a Mamba block would never land on a saved
-            # Gated DeltaNet state; D3Strategy also counts on the hit being
-            # the state's last Mamba block boundary.
-            "--prefix-match-unit": cache_config.prefix_match_unit,
+            # Offloaded hits finer than a Mamba block are not validated yet.
+            "--prefix-match-unit with --kv-offloading-size": (
+                cache_config.prefix_match_unit is not None
+                and cache_config.kv_offloading_size is not None
+            ),
             "--scheduler-cls": scheduler_config.scheduler_cls
             not in (None, *schedulers),
         }
@@ -1310,6 +1311,21 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
             raise ValueError(
                 f"Prefix caching of {architecture} prefix_bidir prompts needs "
                 f"--mamba-ssm-cache-dtype float32, not {requested_ssm_dtype}"
+            )
+
+        # A state's hit lands on the Gated DeltaNet state its prefill saves
+        # inside the step, at its last multiple of the prefix match unit, so
+        # a question recomputes at most that many state tokens. FlashInfer
+        # saves states only every 64 tokens.
+        unit = 64 if gdn == "flashinfer" else 16
+        if cache_config.prefix_match_unit is None:
+            if cache_config.kv_offloading_size is None:
+                cache_config.prefix_match_unit = unit
+        elif cache_config.prefix_match_unit % unit:
+            raise ValueError(
+                f"Prefix caching of {architecture} prefix_bidir prompts with "
+                f"the {gdn} GDN prefill backend needs --prefix-match-unit a "
+                f"multiple of {unit}, not {cache_config.prefix_match_unit}"
             )
 
         # Each prompt is prefilled from its cache hit in one step; the Mamba

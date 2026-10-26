@@ -935,7 +935,7 @@ async def test_d3_prefix_bidir_sends_each_prompts_state_block(d3):
         assert tokenizer.decode(ids[state:]).startswith(".\n\nQuestion:\n")
 
 
-def d3_state_writer(attention_mode, caching, block, lengths, state_tokens):
+def d3_warms_state_first(attention_mode, caching, block, lengths, state_tokens):
     strategy = object.__new__(D3Strategy)
     strategy.state_blocks = attention_mode == "prefix_bidir"
     strategy.context = SimpleNamespace(
@@ -947,29 +947,32 @@ def d3_state_writer(attention_mode, caching, block, lengths, state_tokens):
             )
         )
     )
-    return strategy._state_writer([[0] * n for n in lengths], state_tokens)
+    return strategy._warms_state_first([[0] * n for n in lengths], state_tokens)
 
 
 @pytest.mark.parametrize(
-    "attention_mode,caching,block,lengths,state_tokens,first",
+    "attention_mode,caching,block,lengths,state_tokens,warms",
     [
-        # The state's last boundary is 832; the shortest question ends by 1664.
-        ("prefix_bidir", True, 832, [1700, 1600, 1680], [1000] * 3, 1),
-        # Every question ends past it: the state block goes first alone.
-        ("prefix_bidir", True, 832, [1700, 1690, 1680], [1000] * 3, "state"),
+        # A question would save the state past its state block, in its own
+        # tokens, even one that ends within the state's last block.
+        ("prefix_bidir", True, 832, [1700, 1600, 1680], [1000] * 3, True),
+        ("prefix_bidir", True, 832, [1700, 1690, 1680], [1000] * 3, True),
         # Nothing to reuse: one question, a state within one block, other
         # state blocks, no caching, a noncausal model.
-        ("prefix_bidir", True, 832, [1700], [1000], None),
-        ("prefix_bidir", True, 832, [900, 950], [832] * 2, None),
-        ("prefix_bidir", True, 832, [1700, 1600], [1000, 1001], None),
-        ("prefix_bidir", False, 832, [1700, 1600], [1000] * 2, None),
-        ("prefix_bidir", True, None, [1700, 1600], [1000] * 2, None),
-        ("noncausal_full_attention", True, 832, [1700, 1600], [0] * 2, None),
+        ("prefix_bidir", True, 832, [1700], [1000], False),
+        ("prefix_bidir", True, 832, [900, 950], [832] * 2, False),
+        ("prefix_bidir", True, 832, [1700, 1600], [1000, 1001], False),
+        ("prefix_bidir", False, 832, [1700, 1600], [1000] * 2, False),
+        ("prefix_bidir", True, None, [1700, 1600], [1000] * 2, False),
+        ("noncausal_full_attention", True, 832, [1700, 1600], [0] * 2, False),
     ],
 )
-def test_d3_state_writer(attention_mode, caching, block, lengths, state_tokens, first):
+def test_d3_warms_state_first(
+    attention_mode, caching, block, lengths, state_tokens, warms
+):
     assert (
-        d3_state_writer(attention_mode, caching, block, lengths, state_tokens) == first
+        d3_warms_state_first(attention_mode, caching, block, lengths, state_tokens)
+        is warms
     )
 
 
@@ -995,7 +998,7 @@ def d3_calls(engine):
 @pytest.mark.parametrize("d3", ["prefix_bidir"], indirect=True)
 async def test_d3_prefills_the_state_block_first(d3):
     """With prefix caching, the state block alone is prefilled before the
-    questions when no question saves the state's last boundary itself."""
+    questions."""
     serving, engine, _ = d3_with_caching(d3, block=4)
     response = await serving.create_decision(StructuredDecisionRequest(**D3_REQUEST))
     assert isinstance(response, StructuredDecisionResponse)
@@ -1011,9 +1014,9 @@ async def test_d3_prefills_the_state_block_first(d3):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("d3", ["prefix_bidir"], indirect=True)
-async def test_d3_reads_the_shortest_question_first(d3):
-    """A question that ends within the state's last block saves the state
-    itself: it goes first, and there is no separate state prefill."""
+async def test_d3_prefills_the_state_block_first_before_short_questions(d3):
+    """A question that ends within the state's last block would still save
+    the state in its own tokens: the state block alone goes first."""
     serving, engine, _ = d3_with_caching(d3, block=200)
     # With one 200-token block the state and every question fit before 400.
     response = await serving.create_decision(
@@ -1022,10 +1025,9 @@ async def test_d3_reads_the_shortest_question_first(d3):
     assert isinstance(response, StructuredDecisionResponse)
 
     calls = d3_calls(engine)
-    assert len(calls) == 3
-    lengths = [c[1] for c in calls]
-    assert lengths[0] == min(lengths)
-    assert not any(c[0].endswith("-state") for c in calls)
+    assert len(calls) == 4
+    request_id, length, state = calls[0]
+    assert request_id.endswith("-state") and length == state
 
 
 @pytest.mark.asyncio

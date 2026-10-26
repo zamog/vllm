@@ -15,7 +15,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property, partial
-from typing import Any, ClassVar, Literal, TypeVar
+from typing import Any, ClassVar, TypeVar
 
 import numpy as np
 from PIL import Image
@@ -1370,18 +1370,19 @@ class D3Strategy(ReadStrategy):
         assert engine_input["type"] == "multimodal"
         return engine_input
 
-    def _state_writer(
+    def _warms_state_first(
         self, prompt_ids: Sequence[Sequence[int]], state_tokens: Sequence[int]
-    ) -> int | Literal["state"] | None:
-        """What to prefill before the other questions so they reuse the cached
-        state block: the question whose own prefill saves the state's last
-        cacheable boundary, "state" for the state block alone, or None.
+    ) -> bool:
+        """Whether to prefill the state block alone before the questions, so
+        they reuse it from the prefix cache.
 
         With prefix caching, a question's hit stops at its state block and at
-        the last Gated DeltaNet state saved on a Mamba block boundary, c. A
-        prompt prefilled from 0 saves that state at its own last boundary, so
-        a question that ends within the state's last block saves it at c.
-        Prompts prefilled together reuse nothing of each other."""
+        the last Gated DeltaNet state saved there, c: a prompt of s tokens
+        prefilled from 0 in one step saves its state at its last multiple of
+        the prefix match unit before s (or of the Mamba block without one),
+        if that falls in an earlier Mamba block than s. The state block alone
+        saves it nearest s; a question would save it past s, in its own
+        tokens. Prompts prefilled together reuse nothing of each other."""
         cache_config = self.context.engine_client.vllm_config.cache_config
         block = cache_config.mamba_block_size
         if (
@@ -1390,7 +1391,7 @@ class D3Strategy(ReadStrategy):
             or not block
             or len(prompt_ids) < 2
         ):
-            return None
+            return False
         if len(set(state_tokens)) != 1 or state_tokens[0] <= block:
             logger.debug(
                 "Not prefilling a state block first: state blocks of %s tokens, "
@@ -1398,12 +1399,8 @@ class D3Strategy(ReadStrategy):
                 sorted(set(state_tokens)),
                 block,
             )
-            return None
-        last_boundary = (state_tokens[0] - 1) // block * block
-        shortest = min(range(len(prompt_ids)), key=lambda n: len(prompt_ids[n]))
-        if len(prompt_ids[shortest]) - 1 < last_boundary + block:
-            return shortest
-        return "state"
+            return False
+        return True
 
     async def _warm_state(
         self,
@@ -1525,9 +1522,7 @@ class D3Strategy(ReadStrategy):
                 )
             return result.outputs.data.tolist()
 
-        first = self._state_writer(prompt_ids, state_tokens)
-        logits: list[list[float] | None] = [None] * len(engine_inputs)
-        if first == "state":
+        if self._warms_state_first(prompt_ids, state_tokens):
             await self._warm_state(
                 engine_inputs[0],
                 state_tokens[0],
@@ -1536,17 +1531,12 @@ class D3Strategy(ReadStrategy):
                 trace_headers=trace_headers,
                 priority=priority,
             )
-        elif first is not None:
-            logits[first] = await read_one(first, engine_inputs[first])
-        rest = [n for n in range(len(engine_inputs)) if logits[n] is None]
-        for n, read in zip(
-            rest, await asyncio.gather(*(read_one(n, engine_inputs[n]) for n in rest))
-        ):
-            logits[n] = read
+        logits = await asyncio.gather(
+            *(read_one(n, engine_input) for n, engine_input in enumerate(engine_inputs))
+        )
 
         reads = []
         for q, ids, code_logits in zip(questions, prompt_ids, logits):
-            assert code_logits is not None
             texts, order = self._options(q)
             scaled = [v / self.temperature for v in code_logits[: len(texts)]]
             probs = label_softmax(scaled)

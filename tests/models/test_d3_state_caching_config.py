@@ -169,7 +169,13 @@ def test_needs_a_gdn_backend_that_saves_mid_prefill_states(monkeypatch, gdn, cac
             },
             "--kv-offloading-backend other than native",
         ),
-        ({"cache_config.prefix_match_unit": 256}, "--prefix-match-unit"),
+        (
+            {
+                "cache_config.kv_offloading_size": 4,
+                "cache_config.prefix_match_unit": 64,
+            },
+            "--prefix-match-unit with --kv-offloading-size",
+        ),
         ({"parallel_config.use_ubatching": True}, "micro-batching"),
         (
             {"parallel_config.decode_context_parallel_size": 2},
@@ -187,10 +193,33 @@ def test_refuses_what_it_cannot_cache_with(override, feature):
 
 def test_caches_state_blocks_in_cpu_memory_too():
     """The native OffloadingConnector keeps evicted state blocks in CPU memory;
-    it honors the scheduler's per-request hit cap."""
+    it honors the scheduler's per-request hit cap. Its hits stay on Mamba
+    block boundaries."""
     config = vllm_config(**{"cache_config.kv_offloading_size": 64})
     D3ForSequenceClassificationConfig.verify_and_update_config(config)
     assert config.scheduler_config.scheduler_cls == BIDIRECTIONAL
+    assert config.cache_config.prefix_match_unit is None
+
+
+@pytest.mark.parametrize("gdn,unit", [("flashinfer", 64), ("triton", 16)])
+def test_hits_land_within_a_prefix_match_unit_of_the_state(monkeypatch, gdn, unit):
+    monkeypatch.setattr(
+        qwen_gdn_linear_attn, "_resolve_gdn_prefill_backend", lambda _: ("auto", gdn)
+    )
+    config = vllm_config()
+    D3ForSequenceClassificationConfig.verify_and_update_config(config)
+    assert config.cache_config.prefix_match_unit == unit
+
+    config = vllm_config(**{"cache_config.prefix_match_unit": 4 * unit})
+    D3ForSequenceClassificationConfig.verify_and_update_config(config)
+    assert config.cache_config.prefix_match_unit == 4 * unit
+
+
+def test_refuses_a_prefix_match_unit_flashinfer_cannot_save_states_on():
+    with pytest.raises(ValueError, match="multiple of 64, not 48"):
+        D3ForSequenceClassificationConfig.verify_and_update_config(
+            vllm_config(**{"cache_config.prefix_match_unit": 48})
+        )
 
 
 def test_refuses_a_bfloat16_state_cache():

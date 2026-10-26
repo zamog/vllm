@@ -394,15 +394,18 @@ vllm serve vllm-sr/d3-turbo --max-model-len 65536 --enable-prefix-caching \
     --attention-config '{"backend": "FLASH_ATTN", "flash_attn_version": 4}'
 ```
 
-- The first read of a request prefills the state block and saves it; the
-  other questions then read only the end of the state's last Mamba block and
-  their own tokens. The first read is the shortest question when it ends
-  within the state's last Mamba block, else the state block alone.
+- The first read of a request prefills the state block alone and saves it
+  at its last multiple of `--prefix-match-unit` (64 tokens with the FlashInfer
+  Gated DeltaNet prefill, the Hopper default; 16 with the Triton one); the
+  other questions then read only the rest of the state and their own tokens.
+  A state within its first Mamba block is not saved.
 - Each prompt is prefilled whole in one step, so `--max-num-batched-tokens`
   is at least `--max-model-len`; the Gated DeltaNet state cache is float32.
-  Speculative decoding, KV connectors and offloading, context parallelism,
-  micro-batching and `--prefix-match-unit` are not supported with it. The
-  noncausal sizes cache nothing.
+  Speculative decoding, KV connectors other than CPU offloading
+  (`--kv-offloading-size`), context parallelism and micro-batching are not
+  supported with it. With CPU offloading, hits land on Mamba block
+  boundaries and `--prefix-match-unit` is not supported. The noncausal sizes
+  cache nothing.
 - The state block is cached with its exact tokens and media: requests that
   reuse a state send the same state text and media. A question that depends
   on another's answer goes in a later request with that answer in its own
