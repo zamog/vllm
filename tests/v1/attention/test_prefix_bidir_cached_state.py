@@ -70,27 +70,16 @@ def _backend_config(backend: AttentionBackendEnum, block: int):
     return vllm_config
 
 
-@pytest.mark.parametrize(
-    "backend,block",
-    [
-        # H200: FlashAttention 4 with FlashInfer GDN's 832-token blocks.
-        pytest.param(AttentionBackendEnum.FLASH_ATTN, 832, id="fa4-832"),
-        # A100: Triton with Triton/FLA GDN's 784-token blocks.
-        pytest.param(AttentionBackendEnum.TRITON_ATTN, 784, id="triton-784"),
-    ],
-)
-def test_question_over_cached_state_matches_whole_prompt(backend, block):
-    if backend == AttentionBackendEnum.FLASH_ATTN:
-        from vllm.v1.attention.backends.fa_utils import is_fa_version_supported
-
-        if not (
-            current_platform.is_device_capability_family(90)
-            and is_fa_version_supported(4)
-        ):
-            pytest.skip("FlashAttention 4 on Hopper")
+def run_prefix_bidir(
+    backend: AttentionBackendEnum,
+    block: int,
+    requests: list[tuple[int, int, int]],
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    """Per request: the backend's output rows, the dense reference and a
+    causal-only reference, for ``requests`` of (state tokens, question
+    tokens, cached tokens)."""
     torch.manual_seed(0)
     vllm_config = _backend_config(backend, block)
-    requests = _requests(block)
     seq_lens = [s + q for s, q, _ in requests]
     query_lens = [s + q - c for s, q, c in requests]
     ranges = {i: [(0, s - 1), (s, s + q - 1)] for i, (s, q, _) in enumerate(requests)}
@@ -144,11 +133,39 @@ def test_question_over_cached_state_matches_whole_prompt(backend, block):
         torch.cat(values),
         kv_cache,
     )
-
     scale = HEAD_SIZE**-0.5
     ref_args = (query, k_fulls, v_fulls, query_lens, seq_lens)
     expected = _dense_reference(*ref_args, ranges, None, scale)
-    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
-    # The ranges change the output: a causal read would differ.
     causal = _dense_reference(*ref_args, {}, None, scale)
-    assert not torch.allclose(expected, causal, atol=2e-2, rtol=2e-2)
+    return (
+        list(actual.float().split(query_lens)),
+        list(expected.split(query_lens)),
+        list(causal.split(query_lens)),
+    )
+
+
+@pytest.mark.parametrize(
+    "backend,block",
+    [
+        # H200: FlashAttention 4 with FlashInfer GDN's 832-token blocks.
+        pytest.param(AttentionBackendEnum.FLASH_ATTN, 832, id="fa4-832"),
+        # A100: Triton with Triton/FLA GDN's 784-token blocks.
+        pytest.param(AttentionBackendEnum.TRITON_ATTN, 784, id="triton-784"),
+    ],
+)
+def test_question_over_cached_state_matches_whole_prompt(backend, block):
+    if backend == AttentionBackendEnum.FLASH_ATTN:
+        from vllm.v1.attention.backends.fa_utils import is_fa_version_supported
+
+        if not (
+            current_platform.is_device_capability_family(90)
+            and is_fa_version_supported(4)
+        ):
+            pytest.skip("FlashAttention 4 on Hopper")
+    actual, expected, causal = run_prefix_bidir(backend, block, _requests(block))
+    for i, (got, want, causal_only) in enumerate(zip(actual, expected, causal)):
+        torch.testing.assert_close(
+            got, want, atol=2e-2, rtol=2e-2, msg=lambda m, i=i: f"request {i}: {m}"
+        )
+        # The ranges change the result: a causal read would differ.
+        assert not torch.allclose(want, causal_only, atol=2e-2, rtol=2e-2)
