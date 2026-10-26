@@ -578,6 +578,7 @@ class Scheduler(SchedulerInterface):
             ckpt_block_size,
             drop_eagle_block=self.use_eagle_block_drop,
             num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
+            max_cache_hit_length=request.max_cache_hit_length,
         )
         use_internal_checkpoint = (
             self.mamba_has_prefill_checkpoint_blocks

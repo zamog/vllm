@@ -116,6 +116,17 @@ class PrefixLMScheduler(Scheduler):
                 f"{type(self).__name__} needs a hybrid model in Mamba 'align' "
                 "cache mode"
             )
+        if self.mamba_has_prefill_checkpoint_blocks and (
+            not self.vllm_config.use_v2_model_runner
+            or self.vllm_config.parallel_config.use_ubatching
+        ):
+            # Checkpoints are saved at the hit cap (Request.max_cache_hit_length);
+            # only Model Runner V2 without micro-batching passes it to the
+            # backends, which would otherwise save them past where they are keyed.
+            raise ValueError(
+                f"{type(self).__name__} with Mamba prefill checkpoints needs "
+                "Model Runner V2 without micro-batching"
+            )
         if not self.mamba_has_prefill_checkpoint_blocks:
             # A prefix is prefilled with the rest of its prompt in one chunk,
             # so its Mamba state is cached inside the chunk only if the backend

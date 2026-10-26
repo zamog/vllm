@@ -34,6 +34,13 @@ from .utils import EOS_TOKEN_ID, create_scheduler
 
 pytestmark = pytest.mark.cpu_test
 
+
+@pytest.fixture(autouse=True)
+def model_runner_v2(monkeypatch):
+    """PrefixLM prompts with Mamba prefill checkpoints need Model Runner V2."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+
+
 #: A Mamba backend that saves prefill checkpoints, as FlashInfer GDN does.
 MAMBA = MambaSpec(
     block_size=16,
@@ -128,11 +135,10 @@ def test_hits_stop_at_the_prefix_and_prompts_prefill_whole(cls):
     q1, q2, q3 = (prefix + list(range(200, 224)) + [i] * 6 for i in (1, 2, 3))
 
     assert step(scheduler, make_request("q1", q1, 40)) == {"q1": (0, 70)}
-    # q1 left Mamba state only at 64, past the prefix. q2's attention hit at 32
-    # is a junction where alignment would stop, and the step would wait forever.
-    assert step(scheduler, make_request("q2", q2, 40)) == {"q2": (0, 70)}
-    # The prefix alone leaves its state at 32.
-    assert step(scheduler, make_request("prefix", prefix, 40)) == {"prefix": (0, 40)}
+    # q1 saved its Mamba state inside its prefill at the prefix's last
+    # boundary, 32, not at 64 past the prefix: the other prompts resume there.
+    assert step(scheduler, make_request("q2", q2, 40)) == {"q2": (32, 38)}
+    assert step(scheduler, make_request("prefix", prefix, 40)) == {"prefix": (32, 8)}
     assert step(
         scheduler, make_request("q3", q3, 40), make_request("q1 again", q1, 40)
     ) == {"q3": (32, 38), "q1 again": (32, 38)}
@@ -166,6 +172,30 @@ def test_hits_inside_a_mamba_block_resume_there_and_write_nothing():
     questions = [make_request(f"q{i}", state + [i] * 60, 100) for i in range(2)]
     assert step(scheduler, *questions) == {"q0": (96, 64), "q1": (96, 64)}
     assert all(q.skip_writing_prefix_cache for q in questions)
+
+
+def test_a_question_from_scratch_saves_its_state_for_the_next():
+    """Without a state-only prefill first, a question read from 0 saves the
+    Mamba state at its prefix's last 16-token boundary inside the step, so the
+    next question on the same state, or the same one again, resumes there."""
+    scheduler = create_scheduler(
+        block_size=64,
+        hash_block_size=16,
+        max_num_batched_tokens=256,
+        max_model_len=2048,
+        enable_prefix_caching=True,
+        skip_tokenizer_init=True,
+        mamba_spec=replace(MAMBA, block_size=64),
+        scheduler_cls=PrefixLMScheduler,
+    )
+    state = list(range(100, 200))
+    question = state + [1] * 60
+    assert step(scheduler, make_request("q", question, 100)) == {"q": (0, 160)}
+    assert step(
+        scheduler,
+        make_request("q again", question, 100),
+        make_request("other", state + [2] * 60, 100),
+    ) == {"q again": (96, 64), "other": (96, 64)}
 
 
 def test_pooling_requests_send_their_prefix_in_extra_kwargs():
@@ -427,6 +457,13 @@ def test_waiting_for_the_encoder_holds_no_cached_inputs():
 def test_needs_mamba_align_mode():
     with pytest.raises(ValueError, match="align"):
         create_scheduler(skip_tokenizer_init=True, scheduler_cls=PrefixLMScheduler)
+
+
+def test_needs_model_runner_v2_for_prefill_checkpoints(monkeypatch):
+    # Model Runner V1 does not pass the hit cap its checkpoints are saved at.
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    with pytest.raises(ValueError, match="Model Runner V2"):
+        make_scheduler()
 
 
 @pytest.mark.parametrize("checkpoint_blocks", [0, 1])

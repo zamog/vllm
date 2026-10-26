@@ -168,6 +168,7 @@ def _apply_worker_step(
         checkpoint_alignment=ATTN_BLOCK_SIZE,
         drop_eagle_block=False,
         cache_hit_alignment_tokens=ATTN_BLOCK_SIZE,
+        max_cache_hit_lengths=[request.max_cache_hit_length],
     )
     if col >= 0:
         assert not blocks[col].is_null
@@ -271,3 +272,50 @@ def test_partial_hit_then_checkpointed_chunk_does_not_rekey_cow_block() -> None:
         f"C hits {hit_c} tokens but its mamba block {mamba_hit[0].block_id} "
         f"holds state@{state_at.get(mamba_hit[0].block_id)}"
     )
+
+
+@pytest.mark.parametrize(
+    "cap,position", [(None, 960), (500, 448), (999, 960), (960, 960)]
+)
+def test_checkpoint_position_stops_at_the_hit_cap(cap, position):
+    """A capped checkpoint moves to the cap's last boundary; the block column
+    stays the chunk's second to last, which the manager re-keys."""
+    assert (
+        get_mamba_prefill_checkpoint_position(1000, 64, False, max_cache_hit_length=cap)
+        == position
+    )
+    offsets, cols = compute_mamba_prefill_checkpoints(
+        [1000],
+        [1000],
+        hash_block_size=64,
+        mamba_block_size=832,
+        checkpoint_alignment=64,
+        drop_eagle_block=False,
+        cache_hit_alignment_tokens=64,
+        max_cache_hit_lengths=[cap],
+    )
+    assert (offsets, cols) == ([position], [0])
+
+
+def test_capped_checkpoint_is_keyed_where_it_is_saved() -> None:
+    """A prompt whose hits stop at 2500 (a PrefixLM prefix of 4000 tokens)
+    saves its checkpoint at 2496, not 3984, and the manager keys it there:
+    a request sharing the prefix resumes from the state it holds."""
+    manager = _make_hybrid_kv_cache_manager()
+    state_at: dict[int, int] = {}
+    prefix = [1] * PROMPT_A
+
+    req_a = _make_request("A", prefix + [2] * (4000 - PROMPT_A))
+    req_a.max_cache_hit_length = PROMPT_A
+    assert _prefill_in_one_chunk(manager, req_a, state_at) == 0
+    assert _assert_cached_mamba_slots_hold_claimed_state(manager, req_a, state_at)
+    manager.free(req_a)
+
+    manager.new_step_starts()
+    req_b = _make_request("B", prefix + [3] * 700)
+    blocks_b, hit_b, _ = manager.get_computed_blocks(req_b, PROMPT_A)
+    assert hit_b == get_mamba_prefill_checkpoint_position(
+        4000, ATTN_BLOCK_SIZE, False, max_cache_hit_length=PROMPT_A
+    )
+    (mamba_hit,) = [b for b in blocks_b.blocks[MAMBA_GROUP_ID] if not b.is_null]
+    assert state_at.get(mamba_hit.block_id) == hit_b

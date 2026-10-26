@@ -542,6 +542,7 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
                 prefill_end=prefill_end,
+                max_cache_hit_length=request.max_cache_hit_length,
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
@@ -577,6 +578,7 @@ class KVCacheManager:
             num_local_computed_tokens=num_local_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
             prefill_end=prefill_end,
+            max_cache_hit_length=request.max_cache_hit_length,
         )
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an

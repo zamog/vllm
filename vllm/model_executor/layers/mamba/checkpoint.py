@@ -27,13 +27,15 @@ def compute_mamba_prefill_checkpoints(
     drop_eagle_block: bool,
     cache_hit_alignment_tokens: int,
     num_hash_lookahead_tokens: int = 0,
+    max_cache_hit_lengths: list[int | None] | None = None,
 ) -> tuple[list[int], list[int]]:
     """Per-row internal prefill checkpoint offsets and cache block columns.
 
     Backends call this instead of re-deriving the rules, so they decline in
     lockstep with the scheduler and ``MambaManager``: allocating a checkpoint
     block without writing it leaves the prefix cache serving uninitialized
-    state.
+    state. ``max_cache_hit_lengths`` holds each row's hit cap, as the
+    scheduler applies it (None: uncapped).
 
     Returns:
         ``(offsets, cols)``: the checkpoint's offset into each row's query and
@@ -42,13 +44,16 @@ def compute_mamba_prefill_checkpoints(
     """
     offsets: list[int] = []
     cols: list[int] = []
-    for seq_len, query_len in zip(seq_lens, query_lens):
+    if max_cache_hit_lengths is None:
+        max_cache_hit_lengths = [None] * len(seq_lens)
+    for seq_len, query_len, cap in zip(seq_lens, query_lens, max_cache_hit_lengths):
         query_start = seq_len - query_len
         position = get_mamba_prefill_checkpoint_position(
             seq_len,
             cache_hit_alignment_tokens,
             drop_eagle_block=drop_eagle_block,
             num_hash_lookahead_tokens=num_hash_lookahead_tokens,
+            max_cache_hit_length=cap,
         )
         valid = is_mamba_prefill_checkpoint_valid(
             query_start=query_start,
@@ -130,6 +135,7 @@ class MambaPrefillCheckpointBuilder:
         query_lens = [all_query_lens[row] for row in request_rows]
         seq_lens = m.seq_lens_cpu_upper_bound.tolist()
         block_size = self.kv_cache_spec.block_size
+        caps = m.max_cache_hit_lengths_cpu
         checkpoint_offsets, checkpoint_cols = compute_mamba_prefill_checkpoints(
             [seq_lens[row] for row in request_rows],
             query_lens,
@@ -139,6 +145,9 @@ class MambaPrefillCheckpointBuilder:
             drop_eagle_block=self.drop_eagle_block,
             cache_hit_alignment_tokens=cache_hit_alignment_tokens,
             num_hash_lookahead_tokens=self.vllm_config.num_hash_lookahead_tokens,
+            max_cache_hit_lengths=None
+            if caps is None
+            else [None if (cap := int(caps[row])) < 0 else cap for row in request_rows],
         )
         if not any(checkpoint_offsets):
             return None

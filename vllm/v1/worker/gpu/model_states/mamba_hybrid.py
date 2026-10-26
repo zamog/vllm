@@ -42,11 +42,17 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    max_cache_hit_lengths_cpu: torch.Tensor | None = None
 
     def get_extra_common_attn_kwargs(
         self, kv_cache_group_id: int, num_reqs: int
     ) -> dict[str, Any]:
-        return {"is_prefilling": self.is_prefilling[:num_reqs]}
+        kwargs: dict[str, Any] = {"is_prefilling": self.is_prefilling[:num_reqs]}
+        if self.max_cache_hit_lengths_cpu is not None:
+            kwargs["max_cache_hit_lengths_cpu"] = self.max_cache_hit_lengths_cpu[
+                :num_reqs
+            ]
+        return kwargs
 
     def get_extra_attn_kwargs(
         self, attn_metadata_builder: Any, num_reqs: int
@@ -104,6 +110,11 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_src_off_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
             )
+            # Each request's hit cap, -1 for none: its prefill checkpoint is
+            # saved at or before it, as the scheduler keys it.
+            self._max_cache_hit_length_np = np.full(
+                self.max_num_reqs, -1, dtype=np.int32
+            )
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
@@ -123,6 +134,8 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_state_idx_gpu[req_index].fill_(
                 (new_req_data.num_computed_tokens - 1) // mamba_block_size
             )
+            cap = new_req_data.max_cache_hit_length
+            self._max_cache_hit_length_np[req_index] = -1 if cap is None else cap
 
     def _get_mamba_group_info(
         self, kv_cache_config: KVCacheConfig
@@ -317,10 +330,17 @@ class MambaHybridModelState(DefaultModelState):
                 for group_idx, builder in aligned_index_builders:
                     builder.mamba_aligned_state_indices = all_group_indices[group_idx]
 
+        max_cache_hit_lengths_cpu = None
+        if self._align_mode and not for_capture:
+            max_cache_hit_lengths_cpu = torch.full((num_reqs,), -1, dtype=torch.int32)
+            max_cache_hit_lengths_cpu[: input_batch.num_reqs] = torch.from_numpy(
+                self._max_cache_hit_length_np[input_batch.idx_mapping_np]
+            )
         mamba_attn_metadata = MambaHybridAttnMetadata(
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            max_cache_hit_lengths_cpu=max_cache_hit_lengths_cpu,
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
