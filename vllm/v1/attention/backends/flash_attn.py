@@ -451,7 +451,9 @@ class FlashAttentionBackend(AttentionBackend):
         # FlashAttention 2/3 read the ranges as virtual sequences when the
         # model has no sliding window (see supports_combination).
         return is_fa_version_supported(4) or (
-            is_flash_attn_varlen_func_available() and _mm_prefix_as_segments_supported()
+            current_platform.is_cuda()
+            and is_flash_attn_varlen_func_available()
+            and _mm_prefix_as_segments_supported()
         )
 
     @classmethod

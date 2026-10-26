@@ -55,6 +55,7 @@ def test_validate_configuration_takes_mm_prefix(
     """The selector validates mm_prefix through supports_mm_prefix() before
     supports_combination(); FlashAttention 2/3 must pass both on Ampere."""
     monkeypatch.setattr(flash_attn, "is_flash_attn_varlen_func_available", lambda: True)
+    monkeypatch.setattr(type(flash_attn.current_platform), "is_cuda", lambda *_: True)
     monkeypatch.setattr(flash_attn, "is_fa_version_supported", lambda v: fa4)
     monkeypatch.setattr(
         flash_attn, "get_flash_attn_version", lambda **_: 4 if fa4 else 2
