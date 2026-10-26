@@ -187,6 +187,9 @@ class Request:
         # connector, at this many tokens; None means num_tokens - 1. Set by
         # schedulers whose requests' KV depends on later prompt tokens.
         self.max_cache_hit_length: int | None = None
+        # Keeps this request's blocks out of the prefix cache. Set by
+        # schedulers when its blocks may not hold the KV their hashes name.
+        self.skip_writing_prefix_cache = False
 
         # Multi-modal related
         self.mm_features = mm_features or []
