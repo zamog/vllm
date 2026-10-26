@@ -142,6 +142,32 @@ def test_hits_stop_at_the_prefix_and_prompts_prefill_whole(cls):
     ) == {"p48": (0, 70), "causal": (0, 70)}
 
 
+def test_hits_inside_a_mamba_block_resume_there_and_write_nothing():
+    """With hits every 16 tokens of a 64-token block, a question resumes at the
+    state its state block saved inside the step, at 96, whole; it caches
+    nothing, since its hit block at column 1 holds the state at 96."""
+    scheduler = create_scheduler(
+        block_size=64,
+        hash_block_size=16,
+        max_num_batched_tokens=256,
+        max_model_len=2048,
+        enable_prefix_caching=True,
+        skip_tokenizer_init=True,
+        mamba_spec=replace(MAMBA, block_size=64),
+        scheduler_cls=PrefixLMScheduler,
+    )
+    state = list(range(100, 200))
+    warm_up = make_request("state", state, 100)
+    assert step(scheduler, warm_up) == {"state": (0, 100)}
+    assert not warm_up.skip_writing_prefix_cache
+
+    # Each ends in the block after its hit's, with no checkpoint between:
+    # Mamba alignment alone would stop it at 128.
+    questions = [make_request(f"q{i}", state + [i] * 60, 100) for i in range(2)]
+    assert step(scheduler, *questions) == {"q0": (96, 64), "q1": (96, 64)}
+    assert all(q.skip_writing_prefix_cache for q in questions)
+
+
 def test_pooling_requests_send_their_prefix_in_extra_kwargs():
     """A pooling request's prefix length comes from its extra_kwargs: its
     hits stop at the prefix like a sampling request's."""

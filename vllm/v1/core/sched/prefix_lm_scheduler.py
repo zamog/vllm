@@ -245,13 +245,16 @@ class PrefixLMScheduler(Scheduler):
             start < request.num_prompt_tokens
             and self._prefix_lm_len(request) is not None
         )
-        if (
-            prefix_lm
-            and start % self.cache_config.block_size == 0
-            and start + num_new_tokens == request.num_tokens
-        ):
-            # A whole prompt from a block boundary needs no Mamba split, which
-            # would stop at a shared-prefix junction.
+        if prefix_lm:
+            # A prompt resumed inside a Mamba block holds the state of its
+            # hit in that block; caching its blocks would key it as the
+            # state at the block's end once the step crosses it.
+            request.skip_writing_prefix_cache = (
+                start % self.cache_config.block_size != 0
+            )
+        if prefix_lm and start + num_new_tokens == request.num_tokens:
+            # A whole prompt needs no Mamba split, which would stop at a
+            # shared-prefix junction or at the block its hit ends in.
             return num_new_tokens
         num_new_tokens = super()._mamba_block_aligned_split(
             request,

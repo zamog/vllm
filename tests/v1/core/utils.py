@@ -86,6 +86,7 @@ def create_scheduler(
     use_v2_model_runner: bool | None = None,
     kv_cache_spec: KVCacheSpec | None = None,
     mamba_spec: MambaSpec | None = None,
+    hash_block_size: int | None = None,
     runner: RunnerOption = "auto",
     per_request_spec_decode_metrics: str = "none",
     prefill_schedule_interval: int = 1,
@@ -152,6 +153,7 @@ def create_scheduler(
         cache_dtype="auto",
         enable_prefix_caching=enable_prefix_caching,
         mamba_cache_mode=mamba_spec.mamba_cache_mode if mamba_spec else "none",
+        prefix_match_unit=hash_block_size,
     )
     kv_transfer_config = None
     if isinstance(use_kv_connector, MockKVConfig):
@@ -248,6 +250,7 @@ def create_scheduler(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         block_size=block_size,
+        hash_block_size=hash_block_size,
         log_stats=True,
         structured_output_manager=StructuredOutputManager(vllm_config),
     )
