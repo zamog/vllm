@@ -18,7 +18,7 @@ from tests.v1.attention.test_attention_backends import (
     create_and_prepopulate_kv_cache,
     run_attention_backend,
 )
-from tests.v1.attention.test_mm_prefix import _dense_reference
+from tests.v1.attention.test_mm_prefix import _dense_reference, _enable_mm_prefix
 from tests.v1.attention.utils import (
     BatchSpec,
     create_common_attn_metadata,
@@ -38,7 +38,7 @@ DTYPE = torch.bfloat16
 NUM_HEADS = 24
 NUM_KV_HEADS = 4
 HEAD_SIZE = 256
-# Config only; no weights are loaded.
+# Config only; no weights are loaded. Made a PrefixLM model in _backend_config.
 MODEL = "google/gemma-4-E2B-it"
 
 
@@ -55,12 +55,17 @@ def _requests(block: int) -> list[tuple[int, int, int]]:
 
 
 def _backend_config(backend: AttentionBackendEnum, block: int):
-    vllm_config = create_vllm_config(
-        model_name=MODEL,
-        max_model_len=8 * block,
-        block_size=block,
-        num_gpu_blocks=64,
+    # The FlashAttention builder fills the ranges only for PrefixLM models,
+    # as the Decision 3.0 prefix_bidir model is.
+    vllm_config = _enable_mm_prefix(
+        create_vllm_config(
+            model_name=MODEL,
+            max_model_len=8 * block,
+            block_size=block,
+            num_gpu_blocks=64,
+        )
     )
+    assert vllm_config.model_config.is_mm_prefix_lm
     mc = vllm_config.model_config
     mc.get_head_size = MethodType(lambda self: HEAD_SIZE, mc)
     mc.get_num_attention_heads = MethodType(lambda self, _=None: NUM_HEADS, mc)
