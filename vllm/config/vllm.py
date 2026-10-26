@@ -3421,12 +3421,14 @@ class VllmConfig:
                 "than or equal to and divisible by cp_kv_cache_interleave_size "
                 f"({self.parallel_config.cp_kv_cache_interleave_size})."
             )
-        # Mamba cache align-mode constraints. The PrefixLM schedulers prefill
-        # every prompt whole from its cache hit, so they never stop inside a
-        # multimodal input.
-        scheduler_cls = getattr(self.scheduler_config, "scheduler_cls", None)
-        prefills_whole = isinstance(scheduler_cls, str) and scheduler_cls.startswith(
-            "vllm.v1.core.sched.prefix_lm_scheduler."
+        # Mamba cache align-mode constraints. The bidirectional PrefixLM
+        # schedulers prefill every prompt whole from its cache hit (a prompt
+        # without a prefix length is one prefix), so they never stop inside a
+        # multimodal input. PrefixLMScheduler still chunks causal prompts.
+        prefix_lm = "vllm.v1.core.sched.prefix_lm_scheduler."
+        prefills_whole = getattr(self.scheduler_config, "scheduler_cls", None) in (
+            f"{prefix_lm}BidirectionalPrefixLMScheduler",
+            f"{prefix_lm}BidirectionalPrefixLMAsyncScheduler",
         )
         if self.cache_config.mamba_cache_mode == "align" and not prefills_whole:
             assert not self.scheduler_config.disable_chunked_mm_input, (
