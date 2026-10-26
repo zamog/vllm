@@ -1185,6 +1185,9 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
 
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        # The SSM cache dtype the user asked for, before the checkpoint's
+        # default fills in "auto".
+        requested_ssm_dtype = vllm_config.cache_config.mamba_ssm_cache_dtype
         Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
@@ -1203,7 +1206,9 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
             return
         D3ForSequenceClassificationConfig._check_prefix_bidir_attention(vllm_config)
         if cache_config.enable_prefix_caching:
-            D3ForSequenceClassificationConfig._enable_state_caching(vllm_config)
+            D3ForSequenceClassificationConfig._enable_state_caching(
+                vllm_config, requested_ssm_dtype
+            )
 
     @staticmethod
     def _check_prefix_bidir_attention(vllm_config: "VllmConfig") -> None:
@@ -1229,7 +1234,9 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
             )
 
     @staticmethod
-    def _enable_state_caching(vllm_config: "VllmConfig") -> None:
+    def _enable_state_caching(
+        vllm_config: "VllmConfig", requested_ssm_dtype: str
+    ) -> None:
         """Cache each prompt's state block (a PrefixLM prefix): prefill every
         prompt from its cache hit in one step with
         BidirectionalPrefixLMScheduler, and keep the Gated DeltaNet state of
@@ -1282,14 +1289,13 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
 
         # A cached state block resumes the Gated DeltaNet state saved at its
         # last block boundary; in bfloat16 that state would differ from the
-        # one a full prefill carries.
-        if cache_config.mamba_ssm_cache_dtype == "auto":
+        # one a full prefill carries. This overrides the checkpoint's default.
+        if requested_ssm_dtype == "auto":
             cache_config.mamba_ssm_cache_dtype = "float32"
-        elif cache_config.mamba_ssm_cache_dtype != "float32":
+        elif requested_ssm_dtype != "float32":
             raise ValueError(
                 f"Prefix caching of {architecture} prefix_bidir prompts needs "
-                "--mamba-ssm-cache-dtype float32, not "
-                f"{cache_config.mamba_ssm_cache_dtype}"
+                f"--mamba-ssm-cache-dtype float32, not {requested_ssm_dtype}"
             )
 
         # Each prompt is prefilled from its cache hit in one step; the Mamba
@@ -1301,6 +1307,16 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
             scheduler_config.max_num_batched_tokens = max(
                 scheduler_config.max_num_batched_tokens, model_config.max_model_len
             )
+        # The encoder budgets were set from the token budget before it was
+        # raised; a prompt's media must fit one step with the prompt.
+        scheduler_config.max_num_encoder_input_tokens = max(
+            scheduler_config.max_num_encoder_input_tokens,
+            scheduler_config.max_num_batched_tokens,
+        )
+        scheduler_config.encoder_cache_size = max(
+            scheduler_config.encoder_cache_size,
+            scheduler_config.max_num_batched_tokens,
+        )
         budgets = {
             "--max-num-batched-tokens": scheduler_config.max_num_batched_tokens,
             "--max-num-scheduled-tokens": scheduler_config.max_num_scheduled_tokens,
@@ -1313,7 +1329,9 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
                     f"must be at least --max-model-len ({model_config.max_model_len})"
                 )
         logger.info(
-            "Caching the state blocks of %s prefix_bidir prompts",
+            "Caching the state blocks of %s prefix_bidir prompts (prefix "
+            "caching is supported for them; a warning that this pooling model "
+            "does not officially support it does not apply)",
             architecture,
         )
 

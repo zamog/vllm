@@ -150,7 +150,8 @@ class PrefixLMScheduler(Scheduler):
             # be read in only one of the prefix and the rest.
             logger.warning_once(
                 "Requests with streamed inputs or a media item across the "
-                "prefix end ignore %s",
+                "prefix end ignore %s: they are read causally, or by "
+                "BidirectionalPrefixLMScheduler as one whole-prompt prefix",
                 PREFIX_LM_LEN,
             )
             _drop_prefix_lm_len(request)
@@ -262,7 +263,10 @@ class PrefixLMScheduler(Scheduler):
         super()._update_after_schedule(scheduler_output)
         # A prompt split across steps reads its bidirectional ranges in parts,
         # which changes its outputs silently.
-        for req_id in scheduler_output.num_scheduled_tokens:
+        for req_id, num_scheduled in scheduler_output.num_scheduled_tokens.items():
+            if not num_scheduled:
+                # An async KV load runs no forward pass this step.
+                continue
             request = self.requests[req_id]
             assert (
                 request.num_computed_tokens >= request.num_prompt_tokens

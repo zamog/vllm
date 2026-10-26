@@ -3,6 +3,7 @@
 """PrefixLMScheduler on a full attention + Mamba ("align" cache mode) model."""
 
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -205,6 +206,20 @@ def test_a_split_prefix_lm_prompt_fails_loudly(monkeypatch):
     assert step(make_scheduler(64), make_request("c", list(range(70)), None)) == {
         "c": (0, 64)
     }
+
+
+def test_an_async_kv_load_step_is_not_a_split(monkeypatch):
+    """A request loading its KV asynchronously is listed with 0 tokens while
+    its computed tokens count the external hit."""
+    monkeypatch.setattr(Scheduler, "_update_after_schedule", lambda *_: None)
+    scheduler = make_scheduler()
+    request = make_request("q", list(range(70)), 40)
+    scheduler.add_request(request)
+    request.num_computed_tokens = 32
+    output = SimpleNamespace(num_scheduled_tokens={"q": 0})
+    scheduler._update_after_schedule(output)
+    with pytest.raises(AssertionError, match="scheduled in part"):
+        scheduler._update_after_schedule(SimpleNamespace(num_scheduled_tokens={"q": 6}))
 
 
 def test_prompt_one_token_over_budget_waits():

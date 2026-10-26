@@ -47,6 +47,8 @@ def vllm_config(
             scheduler_cls=None,
             max_num_batched_tokens=max_num_batched_tokens,
             max_num_scheduled_tokens=None,
+            max_num_encoder_input_tokens=max_num_batched_tokens,
+            encoder_cache_size=max_num_batched_tokens,
             user_specified_max_num_batched_tokens=user_budget,
         ),
         parallel_config=SimpleNamespace(
@@ -93,8 +95,18 @@ def test_caches_state_blocks_when_asked():
     assert scheduler.scheduler_cls == BIDIRECTIONAL
     assert scheduler.enable_chunked_prefill
     assert scheduler.long_prefill_token_threshold == 0
-    # A whole prompt fits one step.
+    # A whole prompt and its media fit one step.
     assert scheduler.max_num_batched_tokens == 65536
+    assert scheduler.max_num_encoder_input_tokens == 65536
+    assert scheduler.encoder_cache_size == 65536
+    assert config.cache_config.mamba_ssm_cache_dtype == "float32"
+
+
+def test_overrides_the_checkpoints_bfloat16_state_default():
+    """Only a dtype the user asked for is refused; the checkpoint's default
+    is replaced."""
+    config = vllm_config(**{"model_config.hf_text_config.mamba_ssm_dtype": "bfloat16"})
+    D3ForSequenceClassificationConfig.verify_and_update_config(config)
     assert config.cache_config.mamba_ssm_cache_dtype == "float32"
 
 
