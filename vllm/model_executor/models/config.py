@@ -1283,6 +1283,15 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
                 )
             ),
             "speculative decoding": vllm_config.speculative_config,
+            # A preempted step's eager cache entries (the checkpoint and
+            # attention tail at the hit cap) stay keyed over unwritten KV
+            # until upstream #59963 / #43569 (issue #59907) is in.
+            "--scheduling-policy priority": scheduler_config.policy == "priority",
+            # Periodic checkpoints are not validated with checkpoints at the
+            # hit cap.
+            "--prefix-cache-retention-interval": bool(
+                cache_config.prefix_cache_retention_interval
+            ),
             "context parallelism": (
                 vllm_config.parallel_config.prefill_context_parallel_size > 1
                 or vllm_config.parallel_config.decode_context_parallel_size > 1

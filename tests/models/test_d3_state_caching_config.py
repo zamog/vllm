@@ -41,11 +41,13 @@ def vllm_config(
             kv_offloading_size=None,
             kv_offloading_backend="native",
             prefix_match_unit=None,
+            prefix_cache_retention_interval=0,
         ),
         scheduler_config=SimpleNamespace(
             enable_chunked_prefill=False,
             long_prefill_token_threshold=4096,
             scheduler_cls=None,
+            policy="fcfs",
             max_num_batched_tokens=max_num_batched_tokens,
             max_num_scheduled_tokens=None,
             max_num_encoder_input_tokens=max_num_batched_tokens,
@@ -177,6 +179,11 @@ def test_needs_a_gdn_backend_that_saves_mid_prefill_states(monkeypatch, gdn, cac
             "--prefix-match-unit with --kv-offloading-size",
         ),
         ({"parallel_config.use_ubatching": True}, "micro-batching"),
+        ({"scheduler_config.policy": "priority"}, "--scheduling-policy priority"),
+        (
+            {"cache_config.prefix_cache_retention_interval": 832},
+            "--prefix-cache-retention-interval",
+        ),
         (
             {"parallel_config.decode_context_parallel_size": 2},
             "context parallelism",
