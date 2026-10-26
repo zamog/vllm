@@ -203,7 +203,9 @@ def test_split_prefill_checkpoint(
     )
     layer = _make_layer(vllm_config, backend, weights)
 
-    seq_lens = [64] * num_decodes + [ctx + query for ctx, query in prefills]
+    # A decode's state past its first block: block 0 is the null block, whose
+    # state the decode kernel never loads.
+    seq_lens = [4 * block_size] * num_decodes + [ctx + query for ctx, query in prefills]
     query_lens = [1] * num_decodes + [query for _, query in prefills]
     ckpt_builder = _make_builder(vllm_config, layer, device, checkpoints=True)
     plain_builder = _make_builder(vllm_config, layer, device, checkpoints=False)
