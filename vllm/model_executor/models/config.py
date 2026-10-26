@@ -1241,6 +1241,7 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
         prompt from its cache hit in one step with
         BidirectionalPrefixLMScheduler, and keep the Gated DeltaNet state of
         the cached state blocks in float32."""
+        import vllm.envs as envs
         from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn
         from vllm.platforms import current_platform
 
@@ -1270,7 +1271,15 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
         )
         unsupported = {
             "KV transfer connectors": vllm_config.kv_transfer_config,
-            "--kv-offloading-size": cache_config.kv_offloading_size is not None,
+            # CPU offloading of state blocks: the native OffloadingConnector
+            # honors the per-request hit cap the scheduler sets.
+            "--kv-offloading-backend other than native": (
+                cache_config.kv_offloading_size is not None
+                and (
+                    cache_config.kv_offloading_backend != "native"
+                    or envs.VLLM_USE_SIMPLE_KV_OFFLOAD
+                )
+            ),
             "speculative decoding": vllm_config.speculative_config,
             "context parallelism": (
                 vllm_config.parallel_config.prefill_context_parallel_size > 1

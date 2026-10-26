@@ -158,6 +158,11 @@ class PrefixLMScheduler(Scheduler):
         # A streaming update re-adds an existing request.
         if request.request_id not in self.requests:
             self._salt_by_kind(request)
+            prefix_len = self._prefix_lm_len(request)
+            if prefix_len is not None:
+                # KV past the prefix depends on the rest of the prompt; KV
+                # connectors (CPU offloading) read the same cap.
+                request.max_cache_hit_length = prefix_len
         super().add_request(request)
 
     def _salt_by_kind(self, request: Request) -> None:

@@ -222,6 +222,22 @@ def test_an_async_kv_load_step_is_not_a_split(monkeypatch):
         scheduler._update_after_schedule(SimpleNamespace(num_scheduled_tokens={"q": 6}))
 
 
+@pytest.mark.parametrize(
+    "cls,prefix_len,cap",
+    [
+        (PrefixLMScheduler, 40, 40),
+        (PrefixLMScheduler, None, None),
+        (BidirectionalPrefixLMScheduler, None, 70),
+    ],
+)
+def test_prefix_requests_cap_every_cache_hit(cls, prefix_len, cap):
+    """KV connectors read the request's cap: a loaded hit must stop at the
+    prefix like a local one."""
+    request = make_request("q", list(range(70)), prefix_len)
+    make_scheduler(cls=cls).add_request(request)
+    assert request.max_cache_hit_length == cap
+
+
 def test_prompt_one_token_over_budget_waits():
     # a leaves 32 tokens of budget for b's 33, and 32 is block aligned.
     scheduler = make_scheduler(102)

@@ -183,6 +183,10 @@ class Request:
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
+        # Caps every prefix-cache hit of this request, local or loaded by a KV
+        # connector, at this many tokens; None means num_tokens - 1. Set by
+        # schedulers whose requests' KV depends on later prompt tokens.
+        self.max_cache_hit_length: int | None = None
 
         # Multi-modal related
         self.mm_features = mm_features or []

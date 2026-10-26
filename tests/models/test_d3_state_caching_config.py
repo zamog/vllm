@@ -39,6 +39,7 @@ def vllm_config(
             enable_prefix_caching=caching,
             mamba_ssm_cache_dtype=ssm_dtype,
             kv_offloading_size=None,
+            kv_offloading_backend="native",
             prefix_match_unit=None,
         ),
         scheduler_config=SimpleNamespace(
@@ -161,7 +162,13 @@ def test_needs_a_gdn_backend_that_saves_mid_prefill_states(monkeypatch, gdn, cac
     [
         ({"speculative_config": object()}, "speculative decoding"),
         ({"kv_transfer_config": object()}, "KV transfer connectors"),
-        ({"cache_config.kv_offloading_size": 4}, "--kv-offloading-size"),
+        (
+            {
+                "cache_config.kv_offloading_size": 4,
+                "cache_config.kv_offloading_backend": "lmcache",
+            },
+            "--kv-offloading-backend other than native",
+        ),
         ({"cache_config.prefix_match_unit": 256}, "--prefix-match-unit"),
         ({"parallel_config.use_ubatching": True}, "micro-batching"),
         (
@@ -176,6 +183,14 @@ def test_refuses_what_it_cannot_cache_with(override, feature):
         D3ForSequenceClassificationConfig.verify_and_update_config(
             vllm_config(**override)
         )
+
+
+def test_caches_state_blocks_in_cpu_memory_too():
+    """The native OffloadingConnector keeps evicted state blocks in CPU memory;
+    it honors the scheduler's per-request hit cap."""
+    config = vllm_config(**{"cache_config.kv_offloading_size": 64})
+    D3ForSequenceClassificationConfig.verify_and_update_config(config)
+    assert config.scheduler_config.scheduler_cls == BIDIRECTIONAL
 
 
 def test_refuses_a_bfloat16_state_cache():
