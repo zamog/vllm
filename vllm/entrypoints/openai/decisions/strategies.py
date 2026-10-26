@@ -1427,7 +1427,7 @@ class D3Strategy(ReadStrategy):
             extra_kwargs={self.STATE_TOKENS: state_tokens},
         )
         try:
-            async for _ in self.context.engine_client.encode(
+            async for output in self.context.engine_client.encode(
                 state_input,  # type: ignore[arg-type]
                 params,
                 request_id,
@@ -1435,7 +1435,8 @@ class D3Strategy(ReadStrategy):
                 trace_headers=trace_headers,
                 priority=priority,
             ):
-                pass
+                if output.error is not None:
+                    raise ValueError(output.error.message)
         except Exception:
             logger.warning(
                 "Prefilling the state block of %s failed; its questions read it again",
