@@ -345,6 +345,28 @@ def test_a_prompt_no_step_can_hold_fails():
     assert step(scheduler) == {"c": (0, 16)}
 
 
+def test_a_resumed_prompt_that_fits_a_step_waits():
+    """Only the prompt has to fit a step: a request resumed with more outputs
+    than the step can take waits for a step with room instead of failing."""
+    scheduler = make_scheduler(64)
+    c = make_request("c", list(range(1000, 1100)), None, max_tokens=50)
+    q = make_request("q", list(range(60)), 40, max_tokens=50)
+    step(scheduler, c)
+    step(scheduler, q)
+    for _ in range(8):
+        step(scheduler)
+    assert q.num_tokens > 64 >= q.num_prompt_tokens
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    step(scheduler)  # c resumes first and leaves q part of the budget
+    step(scheduler)
+    assert q.status == RequestStatus.PREEMPTED
+    for _ in range(50):
+        step(scheduler)
+        if q.num_computed_tokens:
+            break
+    assert q.num_computed_tokens >= q.num_prompt_tokens
+
+
 def test_waiting_prompt_holds_the_queue():
     """A PrefixLM prompt that does not fit is not skipped by the causal c behind it."""
     scheduler = make_scheduler(100)

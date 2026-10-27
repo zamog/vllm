@@ -916,8 +916,8 @@ class OffloadingConnectorScheduler:
             )
         if self._sliding_window_groups:
             # the last prompt token has to be recomputed to get the logprobs
-            # for sliding window attention, we must reduce by 1 to make sure
-            # we still have a hit after reduction
+            # for sliding window attention, so the hit must end before it; a
+            # lower bound (e.g. a request's hit cap) is kept as is
             max_hit_size_tokens = min(
                 max_hit_size_tokens, req_status.req.num_tokens - 1
             )

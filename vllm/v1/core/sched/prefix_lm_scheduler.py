@@ -282,13 +282,14 @@ class PrefixLMScheduler(Scheduler):
             long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
-            if request.num_tokens - start > max_prefill_tokens:
+            num_prompt_tokens_left = request.num_prompt_tokens - start
+            if num_prompt_tokens_left > max_prefill_tokens:
                 # No step can hold the rest of the prompt: fail the request
                 # rather than keep it waiting at the head of the queue.
                 self.grammar_compile_error_reqs[request.request_id] = RequestError(
                     code="validation_error",
                     message=(
-                        f"PrefixLM prompt of {request.num_tokens - start} "
+                        f"PrefixLM prompt of {num_prompt_tokens_left} "
                         f"uncached tokens exceeds the {max_prefill_tokens} "
                         "tokens a step can prefill"
                     ),
