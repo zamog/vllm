@@ -220,10 +220,16 @@ def test_fused_post_conv_l0():
     assert g.shape == (0, HV)
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="fused_gdn_prefill_post_conv Triton kernel requires CUDA/ROCm",
+)
 @torch.inference_mode()
 def test_fused_post_conv_row_offsets_past_int32():
     """Tokens whose mixed_qkv row starts past 2**31 elements are processed like
-    the first ones (the kernel's token * row stride needs int64)."""
+    the first ones (the kernel's token * row stride needs int64). Without int64
+    offsets the rows past the boundary read wrong data or fault, which can leave
+    the CUDA context unusable for later tests."""
     if torch.accelerator.get_memory_info()[0] < 12 * 2**30:
         pytest.skip("needs ~10 GiB of free device memory")
     torch.manual_seed(0)
