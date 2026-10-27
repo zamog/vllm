@@ -307,6 +307,19 @@ def test_prompt_one_token_over_budget_waits():
     assert step(scheduler) == {"b": (0, 33)}
 
 
+def test_a_prompt_no_step_can_hold_fails():
+    """A PrefixLM prompt longer than a step finishes with an error instead of
+    holding the queue."""
+    scheduler = make_scheduler(64)
+    big, c = (
+        make_request("big", list(range(70)), 40),
+        make_request("c", list(range(100, 116)), None),
+    )
+    assert step(scheduler, big, c) == {}
+    assert big.status == RequestStatus.FINISHED_ERROR
+    assert step(scheduler) == {"c": (0, 16)}
+
+
 def test_waiting_prompt_holds_the_queue():
     """A PrefixLM prompt that does not fit is not skipped by the causal c behind it."""
     scheduler = make_scheduler(100)

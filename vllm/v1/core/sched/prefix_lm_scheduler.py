@@ -14,6 +14,7 @@ import numpy as np
 
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.outputs import RequestError
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -277,6 +278,21 @@ class PrefixLMScheduler(Scheduler):
             num_external_computed_tokens,
         )
         if prefix_lm and start + num_new_tokens < request.num_prompt_tokens:
+            max_prefill_tokens = self.max_num_scheduled_tokens
+            long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
+            if long_prefill_threshold > 0:
+                max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
+            if request.num_tokens - start > max_prefill_tokens:
+                # No step can hold the rest of the prompt: fail the request
+                # rather than keep it waiting at the head of the queue.
+                self.grammar_compile_error_reqs[request.request_id] = RequestError(
+                    code="validation_error",
+                    message=(
+                        f"PrefixLM prompt of {request.num_tokens - start} "
+                        f"uncached tokens exceeds the {max_prefill_tokens} "
+                        "tokens a step can prefill"
+                    ),
+                )
             # Zero keeps the request waiting at the head of the queue.
             return 0
         return num_new_tokens
