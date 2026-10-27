@@ -172,3 +172,36 @@ def test_exporter_stores_each_callers_checkpoints(caller: str, state_layout: str
 
     assert torch.equal(conv_state, expected_conv)
     assert torch.equal(recurrent_state, expected_recurrent)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="needs a GPU")
+def test_exporter_reads_rows_past_int32_offsets():
+    """A checkpoint whose conv window starts past 2**31 elements of raw_qkv
+    stores the same window as one near the start (token * row stride needs
+    int64)."""
+    if torch.cuda.mem_get_info()[0] < 6 * 2**30:
+        pytest.skip("needs ~4.5 GiB of free device memory")
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device).manual_seed(0)
+    width, conv_window, slot = 8192, 3, 1
+    num_tokens = 2**31 // width + 64
+    offset = num_tokens - 1
+    assert (offset - conv_window) * width >= 2**31
+    raw_qkv = torch.randn(
+        num_tokens, width, device=device, dtype=torch.bfloat16, generator=gen
+    )
+    conv_state = torch.zeros(2, width, conv_window, device=device, dtype=torch.bfloat16)
+    expected = conv_state.clone()
+    expected[slot] = raw_qkv[offset - conv_window : offset].T
+
+    MambaPrefillCheckpointExporter(state_len=conv_window).export(
+        MambaPrefillCheckpointMetadata(
+            torch.tensor([offset], dtype=torch.int32, device=device),
+            torch.tensor([slot], dtype=torch.int32, device=device),
+        ),
+        raw_qkv=raw_qkv,
+        conv_state=conv_state,
+        cu_seqlens=torch.tensor([0, num_tokens], dtype=torch.int32, device=device),
+    )
+
+    assert torch.equal(conv_state, expected)
