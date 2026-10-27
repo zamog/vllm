@@ -1297,11 +1297,6 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
                 or vllm_config.parallel_config.decode_context_parallel_size > 1
             ),
             "micro-batching": vllm_config.parallel_config.use_ubatching,
-            # Offloaded hits finer than a Mamba block are not validated yet.
-            "--prefix-match-unit with --kv-offloading-size": (
-                cache_config.prefix_match_unit is not None
-                and cache_config.kv_offloading_size is not None
-            ),
             "--scheduler-cls": scheduler_config.scheduler_cls
             not in (None, *schedulers),
         }
@@ -1327,9 +1322,10 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
         # a question recomputes at most that many state tokens. FlashInfer
         # saves states only every 64 tokens.
         unit = 64 if gdn == "flashinfer" else 16
+        # CPU offloading stores that state as a partial tail at the same
+        # position (the Mamba checkpoint hand-off carries it).
         if cache_config.prefix_match_unit is None:
-            if cache_config.kv_offloading_size is None:
-                cache_config.prefix_match_unit = unit
+            cache_config.prefix_match_unit = unit
         elif cache_config.prefix_match_unit % unit:
             raise ValueError(
                 f"Prefix caching of {architecture} prefix_bidir prompts with "

@@ -171,13 +171,6 @@ def test_needs_a_gdn_backend_that_saves_mid_prefill_states(monkeypatch, gdn, cac
             },
             "--kv-offloading-backend other than native",
         ),
-        (
-            {
-                "cache_config.kv_offloading_size": 4,
-                "cache_config.prefix_match_unit": 64,
-            },
-            "--prefix-match-unit with --kv-offloading-size",
-        ),
         ({"parallel_config.use_ubatching": True}, "micro-batching"),
         ({"scheduler_config.policy": "priority"}, "--scheduling-policy priority"),
         (
@@ -200,12 +193,12 @@ def test_refuses_what_it_cannot_cache_with(override, feature):
 
 def test_caches_state_blocks_in_cpu_memory_too():
     """The native OffloadingConnector keeps evicted state blocks in CPU memory;
-    it honors the scheduler's per-request hit cap. Its hits stay on Mamba
-    block boundaries."""
+    it honors the scheduler's per-request hit cap, and its hits land within a
+    prefix match unit of the state too, as partial tails."""
     config = vllm_config(**{"cache_config.kv_offloading_size": 64})
     D3ForSequenceClassificationConfig.verify_and_update_config(config)
     assert config.scheduler_config.scheduler_cls == BIDIRECTIONAL
-    assert config.cache_config.prefix_match_unit is None
+    assert config.cache_config.prefix_match_unit == 64
 
 
 @pytest.mark.parametrize("gdn,unit", [("flashinfer", 64), ("triton", 16)])

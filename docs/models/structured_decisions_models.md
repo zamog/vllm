@@ -403,9 +403,12 @@ vllm serve vllm-sr/d3-turbo --max-model-len 65536 --enable-prefix-caching \
   is at least `--max-model-len`; the Gated DeltaNet state cache is float32.
   Speculative decoding, KV connectors other than CPU offloading
   (`--kv-offloading-size`), context parallelism and micro-batching are not
-  supported with it. With CPU offloading, hits land on Mamba block
-  boundaries and `--prefix-match-unit` is not supported. The noncausal sizes
-  cache nothing.
+  supported with it, nor is a periodic `--prefix-cache-retention-interval`.
+  The noncausal sizes cache nothing.
+- With `--kv-offloading-size`, states evicted from the GPU are kept in CPU
+  memory and loaded back, at the same position. The CPU region is in
+  `/dev/shm`, so the container needs that much shared memory: a state of
+  60K tokens takes about 3.8 GB on d3-turbo.
 - The state block is cached with its exact tokens and media: requests that
   reuse a state send the same state text and media. A question that depends
   on another's answer goes in a later request with that answer in its own
