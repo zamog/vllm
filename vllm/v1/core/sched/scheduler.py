@@ -1412,11 +1412,14 @@ class Scheduler(SchedulerInterface):
                     # An async load holds its blocks for the whole transfer with
                     # no forward progress and isn't preemptible here. Admit it
                     # only if it fits in (free - other in-flight reservations)
-                    # plus its own spec decode step blocks, to avoid deadlock and
-                    # predictable preemptions.
+                    # plus its own spec decode step blocks and promotion CoW
+                    # blocks, to avoid deadlock and predictable preemptions.
                     reserved_blocks = (
                         self._inflight_prefill_reserved_blocks()
                         + self._spec_decode_step_blocks
+                        + self.kv_cache_manager.coordinator.get_num_load_cow_blocks(
+                            num_computed_tokens
+                        )
                     )
 
                 # Replayed tokens are already counted in the adopted hit; a
@@ -3353,7 +3356,8 @@ class Scheduler(SchedulerInterface):
         num_tokens = full_num_tokens
         if self.num_spec_tokens:
             num_tokens += 1 + self.num_spec_tokens + self.num_lookahead_tokens
-        return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+        coordinator = self.kv_cache_manager.coordinator
+        num_blocks = coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=num_tokens,
             new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
@@ -3364,6 +3368,11 @@ class Scheduler(SchedulerInterface):
             apply_admission_cap=True,
             prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
         )
+        if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            num_blocks += coordinator.get_num_load_cow_blocks(
+                request.num_computed_tokens
+            )
+        return num_blocks
 
     def _set_kv_fetch_stage(self, request: Request, stage: str | None) -> None:
         kv_fetch_stages = self._kv_fetch_stages

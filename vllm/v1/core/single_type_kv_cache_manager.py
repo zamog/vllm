@@ -268,6 +268,12 @@ class SingleTypeKVCacheManager(ABC):
             num_new_blocks += 1
         return num_new_blocks + num_evictable_blocks
 
+    def get_num_load_cow_blocks(self, num_loaded_tokens: int) -> int:
+        """Upper bound on the blocks a request whose async KV load ends at
+        `num_loaded_tokens` allocates on promotion that
+        `get_num_blocks_to_allocate` cannot see before the load is cached."""
+        return 0
+
     def add_local_computed_blocks(
         self,
         request_id: str,
@@ -1694,6 +1700,16 @@ class MambaManager(SingleTypeKVCacheManager):
                     and checkpoint_idx >= len(blocks) - self.num_speculative_blocks
                 )
             )
+        )
+
+    def get_num_load_cow_blocks(self, num_loaded_tokens: int) -> int:
+        # Caching a load that ends inside a block registers a partial hit
+        # (`_cache_partial_tail_block`), whose state promotion copies into a
+        # new block. An upper bound: a trimmed boundary it doesn't key (a
+        # failed load) needs none.
+        return int(
+            self.mamba_cache_mode == "align"
+            and num_loaded_tokens % self.block_size != 0
         )
 
     def get_num_blocks_to_allocate(

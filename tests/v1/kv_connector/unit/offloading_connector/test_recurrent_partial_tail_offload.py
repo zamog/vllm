@@ -223,3 +223,43 @@ def test_a_question_loads_its_prefix_state_from_cpu_at_the_hit_cap():
     assert scheduled.block_ids[1][(144 - 1) // BLOCK] != 0  # the loaded state
     assert question.is_finished()
     assert question.skip_writing_prefix_cache  # resumed inside a block
+
+
+def test_concurrent_loads_reserve_the_promotion_cow_block():
+    # Each load ends inside a block, so its promotion copies the loaded Mamba
+    # state into a new block. Without reserving it, two loads fit a 24-block
+    # pool together, neither can be promoted, and nothing else runs to free
+    # blocks: the scheduler stalls with both loads complete.
+    h = Harness(num_usable_blocks=24)
+    s = 600  # 600 % 64 = 24: the loaded state ends inside a block
+
+    def state(i: int) -> list[int]:
+        return list(range(10_000 * (i + 1), 10_000 * (i + 1) + s))
+
+    def question(i: int, j: int) -> list[int]:
+        start = 900_000 + 1000 * i + 100 * j
+        return list(range(start, start + 100))
+
+    for i in range(4):
+        warm_up = h.request(f"w{i}", state(i) + question(i, 0), prefix_len=s)
+        h.step(warm_up)
+        for _ in range(3):  # the stores complete
+            h.step()
+        assert warm_up.is_finished()
+    assert h.scheduler.kv_cache_manager.reset_prefix_cache()  # GPU copies gone
+
+    questions = [
+        h.request(f"q{i}", state(i) + question(i, 1), prefix_len=s) for i in range(4)
+    ]
+    loading: set[str] = set()
+    loaded: set[str] = set()
+    for n in range(40):
+        _, meta = h.step(
+            *(questions if n == 0 else ()), finished_recving=loading or None
+        )
+        loading = {job.req_id for job in meta.load_jobs.values()}
+        loaded |= loading
+    assert all(q.is_finished() for q in questions), [
+        (q.request_id, q.status.name) for q in questions
+    ]
+    assert loaded  # the states came back from the CPU tier

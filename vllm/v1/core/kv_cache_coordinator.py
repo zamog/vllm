@@ -266,6 +266,15 @@ class KVCacheCoordinator(ABC):
                 )
         return num_blocks_to_allocate
 
+    def get_num_load_cow_blocks(self, num_loaded_tokens: int) -> int:
+        """Upper bound on the blocks a request whose async KV load ends at
+        `num_loaded_tokens` allocates on promotion that
+        `get_num_blocks_to_allocate` cannot see before the load is cached."""
+        return sum(
+            manager.get_num_load_cow_blocks(num_loaded_tokens)
+            for manager in self.single_type_managers
+        )
+
     def allocate_new_computed_blocks(
         self,
         request_id: str,
