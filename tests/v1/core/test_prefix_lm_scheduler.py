@@ -80,6 +80,7 @@ def make_request(
     resumable=False,
     mm_features=None,
     pooling=False,
+    max_tokens=1,
 ):
     """A PrefixLM request with the strategy's salt, or causal if prefix_len is None."""
     if salt == "own":
@@ -93,7 +94,7 @@ def make_request(
     if pooling:
         pooling_params = PoolingParams(task="classify", extra_kwargs=extra_args)
     else:
-        sampling_params = SamplingParams(max_tokens=1, extra_args=extra_args)
+        sampling_params = SamplingParams(max_tokens=max_tokens, extra_args=extra_args)
         sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
     init_none_hash(sha256)
     return Request(
@@ -172,6 +173,30 @@ def test_hits_inside_a_mamba_block_resume_there_and_write_nothing():
     questions = [make_request(f"q{i}", state + [i] * 60, 100) for i in range(2)]
     assert step(scheduler, *questions) == {"q0": (96, 64), "q1": (96, 64)}
     assert all(q.skip_writing_prefix_cache for q in questions)
+
+
+def test_a_preempted_request_decides_its_cache_writes_again():
+    """A request resumed inside a block writes no cache; preempted, it starts
+    over from no computed tokens, so that no longer holds."""
+    scheduler = create_scheduler(
+        block_size=64,
+        hash_block_size=16,
+        max_num_batched_tokens=256,
+        max_model_len=2048,
+        enable_prefix_caching=True,
+        skip_tokenizer_init=True,
+        mamba_spec=replace(MAMBA, block_size=64),
+        scheduler_cls=PrefixLMScheduler,
+    )
+    state = list(range(100, 200))
+    step(scheduler, make_request("state", state, 100))
+    question = make_request("q", state + [0] * 60, 100, max_tokens=4)
+    assert step(scheduler, question) == {"q": (96, 64)}
+    assert question.skip_writing_prefix_cache
+
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    assert question.status == RequestStatus.PREEMPTED
+    assert not question.skip_writing_prefix_cache
 
 
 def test_a_question_from_scratch_saves_its_state_for_the_next():
