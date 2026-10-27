@@ -918,7 +918,9 @@ class OffloadingConnectorScheduler:
             # the last prompt token has to be recomputed to get the logprobs
             # for sliding window attention, we must reduce by 1 to make sure
             # we still have a hit after reduction
-            max_hit_size_tokens -= 1
+            max_hit_size_tokens = min(
+                max_hit_size_tokens, req_status.req.num_tokens - 1
+            )
             if self._mamba_align_size is not None:
                 # Constrain hit-window to the mamba block size.
                 max_hit_size_tokens = round_down(

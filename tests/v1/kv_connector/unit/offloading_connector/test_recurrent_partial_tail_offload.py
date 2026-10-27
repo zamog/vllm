@@ -263,3 +263,25 @@ def test_concurrent_loads_reserve_the_promotion_cow_block():
         (q.request_id, q.status.name) for q in questions
     ]
     assert loaded  # the states came back from the CPU tier
+
+
+@pytest.mark.parametrize("s", [128, 192])
+def test_a_state_capped_on_a_block_boundary_loads_from_cpu(s: int):
+    # A question that prefills its own state caps its hits at the prefix,
+    # here a multiple of the block: the state is saved at the block's end and
+    # stored as a complete chunk, and a later question loads it from there.
+    h = Harness()
+    prefix = list(range(1000, 1000 + s))
+    first = h.request("w", prefix + list(range(7000, 7020)), prefix_len=s)
+    h.step(first)
+    for _ in range(3):  # the stores complete
+        h.step()
+    assert first.is_finished()
+    assert h.scheduler.kv_cache_manager.reset_prefix_cache()  # GPU copy gone
+
+    question = h.request("q", prefix + list(range(5000, 5020)), prefix_len=s)
+    out, meta = h.step(question)
+    assert not out.num_scheduled_tokens
+    assert question.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert question.num_computed_tokens == s
+    assert len(meta.load_jobs) == 1
