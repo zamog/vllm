@@ -1272,9 +1272,9 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
         unsupported = {
             "KV transfer connectors": vllm_config.kv_transfer_config,
             # CPU offloading of state blocks: the native OffloadingConnector
-            # honors the per-request hit cap the scheduler sets, and its hits
-            # are whole chunks of Mamba blocks (block size = Mamba block size
-            # here), so a loaded hit ends on a saved Gated DeltaNet state.
+            # honors the per-request hit cap the scheduler sets, and loads a
+            # state saved inside a Mamba block as a partial tail, so a loaded
+            # hit ends on a saved Gated DeltaNet state.
             "--kv-offloading-backend other than native": (
                 cache_config.kv_offloading_size is not None
                 and (
@@ -1283,9 +1283,11 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
                 )
             ),
             "speculative decoding": vllm_config.speculative_config,
-            # A preempted step's eager cache entries (the checkpoint and
-            # attention tail at the hit cap) stay keyed over unwritten KV
-            # until upstream #59963 / #43569 (issue #59907) is in.
+            # Measured no faster than FCFS. Also defence in depth: a step it
+            # preempts could leave eager cache entries (the checkpoint and
+            # attention tail at the hit cap) keyed over unwritten KV until
+            # upstream #59963 / #43569 (issue #59907) is in, though pooling
+            # requests don't reach that path.
             "--scheduling-policy priority": scheduler_config.policy == "priority",
             # Periodic checkpoints are not validated with checkpoints at the
             # hit cap.

@@ -261,8 +261,8 @@ class PrefixLMScheduler(Scheduler):
             # hit in that block; caching its blocks would key it as the
             # state at the block's end once the step crosses it. Kept past
             # the prompt: a later cache_blocks would key the same block.
-            # Hits a KV connector loads skip this split; they end on Mamba
-            # block boundaries (the D3 config refuses finer offloaded hits).
+            # A hit a KV connector loads skips this split in its load step and
+            # returns here once loaded, at the same position.
             request.skip_writing_prefix_cache = (
                 start % self.cache_config.block_size != 0
             )
