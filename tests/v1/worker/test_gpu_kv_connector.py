@@ -173,6 +173,7 @@ def test_runner_drains_preempted_saves_before_reusing_pages(
         output.kv_connector_metadata = None
     output.total_num_scheduled_tokens = num_tokens
     output.num_scheduled_tokens = {"new": num_tokens}
+    output.skip_drafts = False
     runner = object.__new__(runner_cls)
     if isinstance(runner, MMEncoderModelRunner):
         runner.input_tensor_semaphore = nullcontext
