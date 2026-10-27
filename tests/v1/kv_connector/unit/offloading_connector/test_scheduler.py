@@ -554,6 +554,29 @@ def test_sync_load_budget_is_shared_per_step():
     assert scheduler._current_batch_sync_loads == {"a"}
 
 
+@pytest.mark.parametrize("tail_stored,expected", [(True, 28), (False, 0)])
+def test_partial_lookup_finds_a_recurrent_state_kept_only_as_a_tail(
+    tail_stored, expected
+):
+    """A prompt prefilled in one chunk keeps its Mamba state only at its
+    mid-block checkpoint, stored as a partial tail and under no complete-chunk
+    key: the lookup bounds the tail search by the attention chunks."""
+    scheduler = _make_partial_tail_scheduler()
+    _make_partial_tail_request(scheduler)
+    req_status = scheduler._req_status["req"]
+    req_status.num_locally_computed_tokens = 0
+    req_status.update_offload_keys()
+    hits = {make_offload_key(b"h3", 0)}  # attention chunk [0, 16)
+    if tail_stored:  # both groups' tail keys at 28
+        hits |= {make_offload_key(b"h6", 0), make_offload_key(b"h6", 1)}
+    _as_mock(scheduler.manager.lookup).side_effect = lambda key, _: (
+        LookupResult.HIT if key in hits else LookupResult.MISS
+    )
+
+    assert scheduler._lookup(req_status) == expected
+    assert req_status.partial_tail_boundary == (28 if tail_stored else None)
+
+
 def test_lookup_cap_stops_at_authoritative_prefix_boundary():
     scheduler = _make_partial_tail_scheduler()
     request = _make_partial_tail_request(scheduler)
@@ -5153,7 +5176,7 @@ class TestEagle:
         spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
         scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
         _as_mock(scheduler.manager.prepare_store).side_effect = (
-            lambda keys, req_context: (generate_store_output(keys))
+            lambda keys, req_context: generate_store_output(keys)
         )
 
         request = MagicMock()
