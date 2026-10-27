@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
@@ -23,6 +24,7 @@ def _new_request(
         prompt_token_ids=list(range(10)),
         pooling_params=PoolingParams(extra_kwargs=extra) if pooling else None,
         num_computed_tokens=num_computed_tokens,
+        max_cache_hit_length=6,
     )
 
 
@@ -70,11 +72,14 @@ def test_add_request_seeds_the_aligned_mamba_state() -> None:
     state.prompt_embeds_state = None
     state.num_accepted_tokens_gpu = torch.zeros(2, dtype=torch.int32)
     state._mamba_state_idx_gpu = torch.zeros(2, dtype=torch.int32)
+    state._max_cache_hit_length_np = np.full(2, -1, dtype=np.int32)
 
     # A question resuming over a cached 1,664-token state.
     state.add_request(1, _new_request(6, num_computed_tokens=1_664))  # type: ignore[arg-type]
 
     assert state._mamba_state_idx_gpu[1] == 1
+    # Its prefill checkpoint is saved at its hit cap, where the scheduler keys it.
+    assert state._max_cache_hit_length_np[1] == 6
     assert state.num_accepted_tokens_gpu[1] == 1
     assert state.blocks["r"] == [(0, 5), (6, 9)]
 
