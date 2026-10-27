@@ -224,7 +224,7 @@ def test_fused_post_conv_l0():
 def test_fused_post_conv_row_offsets_past_int32():
     """Tokens whose mixed_qkv row starts past 2**31 elements are processed like
     the first ones (the kernel's token * row stride needs int64)."""
-    if torch.cuda.mem_get_info()[0] < 12 * 2**30:
+    if torch.accelerator.get_memory_info()[0] < 12 * 2**30:
         pytest.skip("needs ~10 GiB of free device memory")
     torch.manual_seed(0)
     device = "cuda"

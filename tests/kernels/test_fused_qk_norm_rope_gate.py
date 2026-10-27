@@ -131,7 +131,7 @@ def test_fused_qk_norm_rope_gate_row_offsets_past_int32(default_vllm_config) -> 
     num_q_heads, num_kv_heads = 24, 4
     row = num_q_heads * 2 * HEAD_DIM
     num_tokens = 2**31 // row + 16
-    if torch.cuda.mem_get_info()[0] < 12 * 2**30:
+    if torch.accelerator.get_memory_info()[0] < 12 * 2**30:
         pytest.skip("needs ~10 GiB of free device memory")
     device = torch.device("cuda", torch.accelerator.current_device_index())
     torch.set_default_device(device)

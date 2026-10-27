@@ -179,7 +179,7 @@ def test_exporter_reads_rows_past_int32_offsets():
     """A checkpoint whose conv window starts past 2**31 elements of raw_qkv
     stores the same window as one near the start (token * row stride needs
     int64)."""
-    if torch.cuda.mem_get_info()[0] < 6 * 2**30:
+    if torch.accelerator.get_memory_info()[0] < 6 * 2**30:
         pytest.skip("needs ~4.5 GiB of free device memory")
     device = torch.device("cuda")
     gen = torch.Generator(device=device).manual_seed(0)
