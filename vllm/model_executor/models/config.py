@@ -1301,6 +1301,10 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
             "micro-batching": vllm_config.parallel_config.use_ubatching,
             "--scheduler-cls": scheduler_config.scheduler_cls
             not in (None, *schedulers),
+            # Each prompt is prefilled whole from its cache hit.
+            "--long-prefill-token-threshold": (
+                scheduler_config.long_prefill_token_threshold > 0
+            ),
         }
         if features := [name for name, enabled in unsupported.items() if enabled]:
             raise ValueError(
@@ -1336,10 +1340,11 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
             )
 
         # Each prompt is prefilled from its cache hit in one step; the Mamba
-        # prefix cache needs chunked prefill on for that.
+        # prefix cache needs chunked prefill on for that (off by default for
+        # this bidirectional pooling model).
         scheduler_config.enable_chunked_prefill = True
-        scheduler_config.long_prefill_token_threshold = 0
-        scheduler_config.scheduler_cls = schedulers[0]
+        if scheduler_config.scheduler_cls is None:
+            scheduler_config.scheduler_cls = schedulers[0]
         if not scheduler_config.user_specified_max_num_batched_tokens:
             scheduler_config.max_num_batched_tokens = max(
                 scheduler_config.max_num_batched_tokens, model_config.max_model_len
@@ -1365,8 +1370,15 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
         logger.info(
             "Caching the state blocks of %s prefix_bidir prompts (prefix "
             "caching is supported for them; a warning that this pooling model "
-            "does not officially support it does not apply)",
+            "does not officially support it does not apply): scheduler %s, "
+            "chunked prefill on, max_num_batched_tokens %d, encoder budget "
+            "%d, SSM state cache %s, prefix match unit %d",
             architecture,
+            scheduler_config.scheduler_cls,
+            scheduler_config.max_num_batched_tokens,
+            scheduler_config.max_num_encoder_input_tokens,
+            cache_config.mamba_ssm_cache_dtype,
+            cache_config.prefix_match_unit,
         )
 
 

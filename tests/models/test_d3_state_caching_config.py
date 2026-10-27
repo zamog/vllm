@@ -45,7 +45,7 @@ def vllm_config(
         ),
         scheduler_config=SimpleNamespace(
             enable_chunked_prefill=False,
-            long_prefill_token_threshold=4096,
+            long_prefill_token_threshold=0,
             scheduler_cls=None,
             policy="fcfs",
             max_num_batched_tokens=max_num_batched_tokens,
@@ -182,6 +182,10 @@ def test_needs_a_gdn_backend_that_saves_mid_prefill_states(monkeypatch, gdn, cac
             "context parallelism",
         ),
         ({"scheduler_config.scheduler_cls": "my.Scheduler"}, "--scheduler-cls"),
+        (
+            {"scheduler_config.long_prefill_token_threshold": 4096},
+            "--long-prefill-token-threshold",
+        ),
     ],
 )
 def test_refuses_what_it_cannot_cache_with(override, feature):
@@ -189,6 +193,13 @@ def test_refuses_what_it_cannot_cache_with(override, feature):
         D3ForSequenceClassificationConfig.verify_and_update_config(
             vllm_config(**override)
         )
+
+
+def test_keeps_the_users_async_scheduler():
+    asynchronous = BIDIRECTIONAL.replace("Scheduler", "AsyncScheduler")
+    config = vllm_config(**{"scheduler_config.scheduler_cls": asynchronous})
+    D3ForSequenceClassificationConfig.verify_and_update_config(config)
+    assert config.scheduler_config.scheduler_cls == asynchronous
 
 
 def test_caches_state_blocks_in_cpu_memory_too():
