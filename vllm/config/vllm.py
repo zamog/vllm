@@ -2080,6 +2080,16 @@ class VllmConfig:
             self.scheduler_config.scheduler_cls = (
                 f"vllm.v1.core.sched.diffusion_scheduler.{scheduler_name}"
             )
+        # Use the async twin of a model hook's PrefixLM scheduler.
+        prefix_lm = "vllm.v1.core.sched.prefix_lm_scheduler."
+        sched = self.scheduler_config
+        if sched.async_scheduling and sched.scheduler_cls in (
+            f"{prefix_lm}PrefixLMScheduler",
+            f"{prefix_lm}BidirectionalPrefixLMScheduler",
+        ):
+            sched.scheduler_cls = sched.scheduler_cls.removesuffix("Scheduler") + (
+                "AsyncScheduler"
+            )
 
         self._normalize_piecewise_cudagraph_mode(
             breakable_cudagraph_enabled=breakable_cudagraph_enabled
@@ -3411,8 +3421,16 @@ class VllmConfig:
                 "than or equal to and divisible by cp_kv_cache_interleave_size "
                 f"({self.parallel_config.cp_kv_cache_interleave_size})."
             )
-        # Mamba cache align-mode constraints
-        if self.cache_config.mamba_cache_mode == "align":
+        # Mamba cache align-mode constraints. The bidirectional PrefixLM
+        # schedulers prefill every prompt whole from its cache hit (a prompt
+        # without a prefix length is one prefix), so they never stop inside a
+        # multimodal input. PrefixLMScheduler still chunks causal prompts.
+        prefix_lm = "vllm.v1.core.sched.prefix_lm_scheduler."
+        prefills_whole = getattr(self.scheduler_config, "scheduler_cls", None) in (
+            f"{prefix_lm}BidirectionalPrefixLMScheduler",
+            f"{prefix_lm}BidirectionalPrefixLMAsyncScheduler",
+        )
+        if self.cache_config.mamba_cache_mode == "align" and not prefills_whole:
             assert not self.scheduler_config.disable_chunked_mm_input, (
                 "Chunked MM input is required because we need the flexibility "
                 "to schedule a multiple of block_size tokens even if they are "

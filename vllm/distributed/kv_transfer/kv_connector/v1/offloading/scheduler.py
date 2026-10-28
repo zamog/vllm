@@ -367,6 +367,8 @@ class RequestOffloadState:
     # Fine-grained token boundary selected beyond the last complete offload
     # chunk. It is consumed when the corresponding load is scheduled.
     partial_tail_boundary: int | None = None
+    # The group whose complete-chunk lookup found nothing, ending the lookup.
+    complete_chunk_miss_group: int | None = None
     # True once a load from the offload tier was scheduled for this request.
     loaded_from_offload: bool = False
     # Loaded attention keys cover their token positions. Recurrent state
@@ -890,14 +892,17 @@ class OffloadingConnectorScheduler:
         self,
         req_status: RequestOffloadState,
         max_num_new_tokens: int | None = None,
+        groups: tuple[int, ...] | None = None,
     ) -> int | None:
         """Find how many tokens beyond num_locally_computed_tokens can be loaded.
 
         Iterates full-attention groups first (prefix lookup), then sliding-window
         groups (suffix lookup). Each group may tighten max_hit_size_tokens, which
         can invalidate an earlier group's result, so the loop re-runs when that
-        happens until num_hit_tokens converges.
+        happens until num_hit_tokens converges. ``groups`` restricts the
+        lookup to those groups (default: every lookup group).
         """
+        all_groups = self._lookup_groups if groups is None else groups
         num_computed_tokens = req_status.num_locally_computed_tokens
         max_hit_size_tokens: int = req_status.req.num_tokens
         if max_num_new_tokens is not None:
@@ -911,9 +916,11 @@ class OffloadingConnectorScheduler:
             )
         if self._sliding_window_groups:
             # the last prompt token has to be recomputed to get the logprobs
-            # for sliding window attention, we must reduce by 1 to make sure
-            # we still have a hit after reduction
-            max_hit_size_tokens -= 1
+            # for sliding window attention, so the hit must end before it; a
+            # lower bound (e.g. a request's hit cap) is kept as is
+            max_hit_size_tokens = min(
+                max_hit_size_tokens, req_status.req.num_tokens - 1
+            )
             if self._mamba_align_size is not None:
                 # Constrain hit-window to the mamba block size.
                 max_hit_size_tokens = round_down(
@@ -922,7 +929,8 @@ class OffloadingConnectorScheduler:
 
         num_hit_tokens: int = 0
         defer_lookup = False
-        lookup_groups = self._lookup_groups
+        req_status.complete_chunk_miss_group = None
+        lookup_groups = all_groups
         for state in req_status.group_states:
             state.lookup_hit_end_chunk_idx = 0
 
@@ -1016,6 +1024,7 @@ class OffloadingConnectorScheduler:
                         initial_window + int(is_eagle_unverified),
                     )
                 if num_hit_chunks == 0:
+                    req_status.complete_chunk_miss_group = group_idx
                     return 0
 
                 if num_hit_chunks is None:
@@ -1042,11 +1051,15 @@ class OffloadingConnectorScheduler:
                         # make another iteration on all groups to check
                         # if we still need to defer lookup
                         defer_lookup = False
-                        lookup_groups = self._lookup_groups
+                        lookup_groups = all_groups
                     elif looked_up_sliding_window and not lookup_groups:
                         # we need another iteration to confirm previously looked up
                         # sliding window works with the new_num_hit_tokens
-                        lookup_groups = self._sliding_window_groups
+                        lookup_groups = tuple(
+                            group
+                            for group in self._sliding_window_groups
+                            if group in all_groups
+                        )
 
                 looked_up_sliding_window |= sliding_window_size_in_chunks is not None
                 num_hit_tokens = new_num_hit_tokens
@@ -1110,7 +1123,34 @@ class OffloadingConnectorScheduler:
         req_status: RequestOffloadState,
         max_num_new_tokens: int | None = None,
     ) -> int | None:
-        complete_hit = self._lookup_complete_chunks(req_status, max_num_new_tokens)
+        hit = self._lookup_with_groups(req_status, max_num_new_tokens)
+        if (
+            hit != 0
+            or not self.config.supports_partial_tail
+            or req_status.complete_chunk_miss_group not in self._cow_source_groups
+        ):
+            return hit
+        # A recurrent (align-mode Mamba) group keeps a state only where one
+        # was saved, e.g. a prefill checkpoint inside a block, which is stored
+        # as a partial tail but under no complete-chunk key. Bound the search
+        # by the attention groups' complete chunks and take only a partial
+        # tail, which carries every group's key.
+        hit = self._lookup_with_groups(
+            req_status, max_num_new_tokens, self._full_attention_groups
+        )
+        if req_status.partial_tail_boundary is None:
+            return None if hit is None else 0
+        return hit
+
+    def _lookup_with_groups(
+        self,
+        req_status: RequestOffloadState,
+        max_num_new_tokens: int | None = None,
+        complete_chunk_groups: tuple[int, ...] | None = None,
+    ) -> int | None:
+        complete_hit = self._lookup_complete_chunks(
+            req_status, max_num_new_tokens, complete_chunk_groups
+        )
         req_status.partial_tail_boundary = None
         if complete_hit is None or not self.config.supports_partial_tail:
             return complete_hit

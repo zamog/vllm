@@ -450,6 +450,11 @@ class CommonAttentionMetadata:
     decode rows (assumes every draft was accepted). Not safe for kernels
     that need exact per-row context lengths on decode rows."""
 
+    max_cache_hit_lengths_cpu: torch.Tensor | None = None
+    """(batch_size,) CPU int32 hit cap of each row's request
+    (``Request.max_cache_hit_length``), -1 for none. Mamba prefill checkpoints
+    are saved at or before it, where the scheduler keys them."""
+
     req_idx: np.ndarray | None = None
     """(batch_size,) index of each row's request in the runner's request
     table. Rows of one request are adjacent, so equal neighbours are PCP
@@ -553,6 +558,7 @@ class CommonAttentionMetadata:
             ),
             seq_lens_cpu_upper_bound=maybe_slice_reqs(self.seq_lens_cpu_upper_bound),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
+            max_cache_hit_lengths_cpu=maybe_slice_reqs(self.max_cache_hit_lengths_cpu),
             req_idx=maybe_slice_reqs(self.req_idx),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
             replayssm_decode_base_cpu=maybe_slice_reqs(self.replayssm_decode_base_cpu),

@@ -1215,6 +1215,9 @@ class D3Strategy(ReadStrategy):
     #: The runtime reads videos at 2 frames per second, 4 to 32 frames each.
     VIDEO_FPS = 2
     VIDEO_MAX_FRAMES = 32
+    #: `PoolingParams.extra_kwargs` key of a prefix_bidir prompt's state block
+    #: size (`vllm.model_executor.models.d3.STATE_TOKENS`).
+    STATE_TOKENS = "prefix_lm_len"
 
     def __init__(self, context: ReadContext):
         super().__init__(context)
@@ -1224,6 +1227,7 @@ class D3Strategy(ReadStrategy):
             raise ValueError(f"unknown decision prompt {decision['prompt']!r}")
         self.codes: list[str] = decision["codes"]
         self.temperature = float(decision.get("temperature", 1.0))
+        self.state_blocks = decision.get("attention_mode") == "prefix_bidir"
         self.max_model_len = model_config.max_model_len
         self.tokenizer = context.online_renderer.renderer.get_tokenizer()
 
@@ -1302,6 +1306,21 @@ class D3Strategy(ReadStrategy):
     def _tokens(self, text: str) -> list[int]:
         return self.tokenizer.encode(text, add_special_tokens=False)
 
+    def _encode(self, text: str, state: str) -> tuple[list[int], int]:
+        """``text``'s tokens and, for prefix_bidir checkpoints, how many lead
+        tokens are its state block: those that end by the end of the state text,
+        so a token straddling it belongs to the question block."""
+        if not self.state_blocks:
+            return self._tokens(text), 0
+        end = text.index(f"State:\n{state}\n\nQuestion:\n") + len(f"State:\n{state}")
+        encoded = self.tokenizer(  # type: ignore[call-arg]
+            text, add_special_tokens=False, return_offsets_mapping=True
+        )
+        offsets = encoded["offset_mapping"]
+        return encoded["input_ids"], next(
+            (i for i, (_, stop) in enumerate(offsets) if stop > end), len(offsets)
+        )
+
     async def _render_media(
         self, prefix: str, media: Mapping[str, Sequence[str]], cache_salt: str | None
     ) -> MultiModalInput:
@@ -1351,6 +1370,77 @@ class D3Strategy(ReadStrategy):
         assert engine_input["type"] == "multimodal"
         return engine_input
 
+    def _warms_state_first(
+        self, prompt_ids: Sequence[Sequence[int]], state_tokens: Sequence[int]
+    ) -> bool:
+        """Whether to prefill the state block alone before the questions, so
+        they reuse it from the prefix cache.
+
+        With prefix caching, a question's hit stops at its state block and at
+        the last Gated DeltaNet state saved there, c: a prompt prefilled from
+        0 in one step saves the state at the last multiple of the prefix match
+        unit (or of the Mamba block without one) within its state block of s
+        tokens, if the prompt is longer than one Mamba block.
+        Prompts prefilled together reuse nothing of each other, so the state
+        block goes first, alone: the shortest prompt that saves it."""
+        cache_config = self.context.engine_client.vllm_config.cache_config
+        block = cache_config.mamba_block_size
+        if (
+            not self.state_blocks
+            or not cache_config.enable_prefix_caching
+            or not block
+            or len(prompt_ids) < 2
+        ):
+            return False
+        if len(set(state_tokens)) != 1 or state_tokens[0] <= block:
+            logger.debug(
+                "Not prefilling a state block first: state blocks of %s tokens, "
+                "Mamba block %d",
+                sorted(set(state_tokens)),
+                block,
+            )
+            return False
+        return True
+
+    async def _warm_state(
+        self,
+        engine_input: EngineInput,
+        state_tokens: int,
+        request_id: str,
+        *,
+        lora_request: LoRARequest | None,
+        trace_headers: Mapping[str, str] | None,
+        priority: int,
+    ) -> None:
+        """Prefill a prompt's state block alone, so the questions after it
+        reuse it. A failure only costs the reuse."""
+        state_input = {
+            **engine_input,
+            "prompt_token_ids": list(engine_input["prompt_token_ids"][:state_tokens]),
+        }
+        params = PoolingParams(
+            task="classify",
+            use_activation=False,
+            extra_kwargs={self.STATE_TOKENS: state_tokens},
+        )
+        try:
+            async for output in self.context.engine_client.encode(
+                state_input,  # type: ignore[arg-type]
+                params,
+                request_id,
+                lora_request=lora_request,
+                trace_headers=trace_headers,
+                priority=priority,
+            ):
+                if output.error is not None:
+                    raise ValueError(output.error.message)
+        except Exception:
+            logger.warning(
+                "Prefilling the state block of %s failed; its questions read it again",
+                request_id,
+                exc_info=True,
+            )
+
     async def read(
         self,
         questions: list[Question],
@@ -1378,6 +1468,7 @@ class D3Strategy(ReadStrategy):
 
         engine_inputs: list[EngineInput] = []
         prompt_ids: list[list[int]] = []
+        state_tokens: list[int] = []
         if placeholders:
             # The media come first, so every prompt starts with the same
             # prefix, which ends at the last media placeholder.
@@ -1388,15 +1479,19 @@ class D3Strategy(ReadStrategy):
                     "the questions' prompts do not share their media"
                 )
             media_input = await self._render_media(prefix, media or {}, cache_salt)
+            media_ids = media_input["prompt_token_ids"]
             for p in prompts:
-                ids = media_input["prompt_token_ids"] + self._tokens(p[split:])
+                tail, tail_state = self._encode(p[split:], state)
+                ids = media_ids + tail
                 engine_inputs.append({**media_input, "prompt_token_ids": ids})
                 prompt_ids.append(ids)
+                state_tokens.append(len(media_ids) + tail_state)
         else:
-            prompt_ids = [self._tokens(p) for p in prompts]
-            engine_inputs = [
-                tokens_input(ids, cache_salt=cache_salt) for ids in prompt_ids
-            ]
+            for p in prompts:
+                ids, count = self._encode(p, state)
+                engine_inputs.append(tokens_input(ids, cache_salt=cache_salt))
+                prompt_ids.append(ids)
+                state_tokens.append(count)
         for q, ids in zip(questions, prompt_ids):
             if len(ids) > self.max_model_len:
                 raise StructuredDecisionError(
@@ -1405,10 +1500,14 @@ class D3Strategy(ReadStrategy):
                 )
 
         async def read_one(n: int, engine_input: EngineInput) -> list[float]:
+            extra = {self.STATE_TOKENS: state_tokens[n]} if self.state_blocks else None
+            params = PoolingParams(
+                task="classify", use_activation=False, extra_kwargs=extra
+            )
             result = None
             async for result in self.context.engine_client.encode(
                 engine_input,
-                PoolingParams(task="classify", use_activation=False),
+                params,
                 f"{request_id}-{n}",
                 lora_request=lora_request,
                 trace_headers=trace_headers,
@@ -1423,8 +1522,17 @@ class D3Strategy(ReadStrategy):
                 )
             return result.outputs.data.tolist()
 
+        if self._warms_state_first(prompt_ids, state_tokens):
+            await self._warm_state(
+                engine_inputs[0],
+                state_tokens[0],
+                f"{request_id}-state",
+                lora_request=lora_request,
+                trace_headers=trace_headers,
+                priority=priority,
+            )
         logits = await asyncio.gather(
-            *(read_one(n, inputs) for n, inputs in enumerate(engine_inputs))
+            *(read_one(n, engine_input) for n, engine_input in enumerate(engine_inputs))
         )
 
         reads = []

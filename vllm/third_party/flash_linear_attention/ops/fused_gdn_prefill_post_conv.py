@@ -63,7 +63,8 @@ def _fused_post_conv_kernel(
 
     HK: tl.constexpr = H * K
 
-    offs_t = i_tb * BLOCK_T + tl.arange(0, BLOCK_T)  # [BLOCK_T]
+    # int64: offs_t * row stride passes 2**31 from about 210K tokens (row 10240).
+    offs_t = i_tb.to(tl.int64) * BLOCK_T + tl.arange(0, BLOCK_T)  # [BLOCK_T]
     mask_t = offs_t < L
 
     if i_head < H:

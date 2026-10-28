@@ -36,6 +36,12 @@ class FlashAttentionDiffKVBackend(FlashAttentionBackend):
     head_size_v: int = 128
 
     @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        # Its forward reads neither PrefixLM path (FlashAttention 4 mask or
+        # FlashAttention 2/3 virtual sequences).
+        return False
+
+    @classmethod
     def set_head_size_v(cls, head_size_v: int) -> None:
         cls.head_size_v = head_size_v
 

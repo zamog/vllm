@@ -200,6 +200,11 @@ def get_attn_backend(
         _run_kv_cache_dtype=(
             cache_config.cache_dtype if cache_config is not None else None
         ),
+        _run_model_sliding_window=(
+            vllm_config.model_config.get_sliding_window()
+            if vllm_config.model_config is not None
+            else None
+        ),
     )
 
 
@@ -210,9 +215,11 @@ def _cached_get_attn_backend(
     num_heads: int | None = None,
     *,
     _run_kv_cache_dtype: CacheDType | None = None,
+    _run_model_sliding_window: int | None = None,
 ) -> type[AttentionBackend]:
-    # Some platform selectors inspect the run-wide cache dtype. Keep it in the
-    # cache key even though they read the value from the current config.
+    # Some platform selectors inspect the run-wide cache dtype and the model's
+    # sliding window (FlashAttention 2/3 PrefixLM support). Keep them in the
+    # cache key even though they read the values from the current config.
     from vllm.platforms import current_platform
 
     attention_cls = current_platform.get_attn_backend_cls(

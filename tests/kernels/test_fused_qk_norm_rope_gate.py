@@ -118,3 +118,64 @@ def test_fused_qk_norm_rope_gate_matches_reference(
     torch.testing.assert_close(q_out, q_ref, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(k_out, k_ref, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(gate_out, gate_ref, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="fused_qk_rmsnorm_rope_gate Triton kernel requires CUDA/ROCm",
+)
+@torch.inference_mode()
+def test_fused_qk_norm_rope_gate_row_offsets_past_int32(default_vllm_config) -> None:
+    """Tokens whose q_gate row starts past 2**31 elements are processed like
+    the first ones (the kernel's token * row stride needs int64)."""
+    num_q_heads, num_kv_heads = 24, 4
+    row = num_q_heads * 2 * HEAD_DIM
+    num_tokens = 2**31 // row + 16
+    if torch.accelerator.get_memory_info()[0] < 12 * 2**30:
+        pytest.skip("needs ~10 GiB of free device memory")
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    torch.set_default_device(device)
+    set_random_seed(SEED)
+
+    q_gate = torch.randn(num_tokens, row, dtype=DTYPE)
+    k = torch.randn(num_tokens, num_kv_heads * HEAD_DIM, dtype=DTYPE)
+    q_norm = GemmaRMSNorm(HEAD_DIM, eps=RMS_NORM_EPS).to(device, dtype=DTYPE)
+    k_norm = GemmaRMSNorm(HEAD_DIM, eps=RMS_NORM_EPS).to(device, dtype=DTYPE)
+    rope = RotaryEmbedding(
+        HEAD_DIM, ROTARY_DIM, MAX_POSITION_EMBEDDINGS, ROPE_THETA, True, DTYPE
+    ).to(device)
+    positions = torch.arange(num_tokens, dtype=torch.long)
+
+    q_out, k_out, gate_out = fused_qk_rmsnorm_rope_gate(
+        q_gate,
+        k,
+        q_norm.weight,
+        k_norm.weight,
+        rope.cos_sin_cache,
+        positions,
+        RMS_NORM_EPS,
+        num_q_heads,
+        num_kv_heads,
+        HEAD_DIM,
+        ROTARY_DIM,
+        norm_beta=1.0,
+    )
+
+    # Rows before and past the 2**31 boundary.
+    rows = torch.tensor([0, 1, num_tokens - 17, num_tokens - 2, num_tokens - 1])
+    assert rows[-1] * row >= 2**31
+    q_gate_heads = q_gate[rows].view(len(rows), num_q_heads, 2 * HEAD_DIM)
+    q_ref = q_norm.forward_native(q_gate_heads[..., :HEAD_DIM])
+    k_ref = k_norm.forward_native(k[rows].view(len(rows), num_kv_heads, HEAD_DIM))
+    assert isinstance(q_ref, torch.Tensor)
+    assert isinstance(k_ref, torch.Tensor)
+    q_ref, k_ref = rope.forward_native(
+        positions[rows],
+        q_ref.reshape(len(rows), -1),
+        k_ref.reshape(len(rows), -1),
+    )
+    assert k_ref is not None
+    gate_ref = q_gate_heads[..., HEAD_DIM:].reshape(len(rows), -1)
+    torch.testing.assert_close(q_out[rows], q_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(k_out[rows], k_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(gate_out[rows], gate_ref, atol=0, rtol=0)

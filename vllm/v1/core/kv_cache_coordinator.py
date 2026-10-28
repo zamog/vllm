@@ -202,6 +202,7 @@ class KVCacheCoordinator(ABC):
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
+        max_cache_hit_length: int | None = None,
     ) -> int:
         """Get the number of device blocks needed to be allocated for the request.
 
@@ -228,6 +229,8 @@ class KVCacheCoordinator(ABC):
                 retention Mamba reserves a prefill checkpoint only on the chunk
                 reaching it; under dense retention every chunk publishes a
                 state, so it is ignored (0).
+            max_cache_hit_length: The request's hit cap; Mamba saves its prefill
+                checkpoint at or before it.
 
         Returns:
             The number of blocks to allocate.
@@ -259,8 +262,18 @@ class KVCacheCoordinator(ABC):
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
                     prefill_end=prefill_end,
+                    max_cache_hit_length=max_cache_hit_length,
                 )
         return num_blocks_to_allocate
+
+    def get_num_load_cow_blocks(self, num_loaded_tokens: int) -> int:
+        """Upper bound on the blocks a request whose async KV load ends at
+        `num_loaded_tokens` allocates on promotion that
+        `get_num_blocks_to_allocate` cannot see before the load is cached."""
+        return sum(
+            manager.get_num_load_cow_blocks(num_loaded_tokens)
+            for manager in self.single_type_managers
+        )
 
     def allocate_new_computed_blocks(
         self,

@@ -1171,8 +1171,15 @@ def get_mamba_prefill_checkpoint_position(
     hash_block_size: int,
     drop_eagle_block: bool,
     num_hash_lookahead_tokens: int = 0,
+    max_cache_hit_length: int | None = None,
 ) -> int:
-    """Return the reusable Mamba checkpoint boundary for a prefill."""
+    """Return the reusable Mamba checkpoint boundary for a prefill.
+
+    ``max_cache_hit_length`` is the request's hit cap
+    (``Request.max_cache_hit_length``): a later hit never passes it, so the
+    checkpoint is saved at or before it. The cap bounds the position after
+    ``num_hash_lookahead_tokens`` has left its tokens; the tighter one wins.
+    """
     # Leave tokens for logits recomputation and the checkpoint's hash.
     # EAGLE's block drop already leaves tokens to recompute.
     proof_limit = (
@@ -1180,6 +1187,8 @@ def get_mamba_prefill_checkpoint_position(
         if drop_eagle_block
         else num_tokens - max(1, num_hash_lookahead_tokens)
     )
+    if max_cache_hit_length is not None:
+        proof_limit = min(proof_limit, max_cache_hit_length)
     checkpoint_position = proof_limit // hash_block_size * hash_block_size
     if drop_eagle_block:
         checkpoint_position -= hash_block_size

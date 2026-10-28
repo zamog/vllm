@@ -220,6 +220,54 @@ def test_fused_post_conv_l0():
     assert g.shape == (0, HV)
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="fused_gdn_prefill_post_conv Triton kernel requires CUDA/ROCm",
+)
+@torch.inference_mode()
+def test_fused_post_conv_row_offsets_past_int32():
+    """Tokens whose mixed_qkv row starts past 2**31 elements are processed like
+    the first ones (the kernel's token * row stride needs int64). Without int64
+    offsets the rows past the boundary read wrong data or fault, which can leave
+    the CUDA context unusable for later tests."""
+    if torch.accelerator.get_memory_info()[0] < 12 * 2**30:
+        pytest.skip("needs ~10 GiB of free device memory")
+    torch.manual_seed(0)
+    device = "cuda"
+    H, HV, K, V = 16, 32, 128, 128
+    qkv_dim = 2 * H * K + HV * V
+    L = 2**31 // qkv_dim + 32
+
+    conv_output = torch.randn(L, qkv_dim, dtype=torch.bfloat16, device=device)
+    a = torch.randn(L, HV, dtype=torch.bfloat16, device=device)
+    b = torch.randn(L, HV, dtype=torch.bfloat16, device=device)
+    A_log = torch.randn(HV, dtype=torch.float32, device=device) - 2.0
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device) * 0.1
+
+    q, k, v, g, beta = fused_post_conv_prep(
+        conv_output,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        num_k_heads=H,
+        head_k_dim=K,
+        head_v_dim=V,
+    )
+
+    # Rows before and past the 2**31 boundary.
+    rows = torch.tensor([0, 1, L - 33, L - 2, L - 1], device=device)
+    assert rows[-1] * qkv_dim >= 2**31
+    ref_q, ref_k, ref_v, ref_g, ref_beta = reference_post_conv(
+        conv_output[rows], a[rows], b[rows], A_log, dt_bias, H, K, V
+    )
+    torch.testing.assert_close(q[rows], ref_q, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(k[rows], ref_k, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(v[rows], ref_v, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(g[rows], ref_g, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(beta[rows], ref_beta, atol=1e-4, rtol=1e-4)
+
+
 @pytest.mark.parametrize(
     "head_ratio,tp_size,query_lengths,state_dtype,norm_dtype",
     [

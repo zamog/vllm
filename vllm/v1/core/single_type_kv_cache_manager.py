@@ -183,6 +183,7 @@ class SingleTypeKVCacheManager(ABC):
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
+        max_cache_hit_length: int | None = None,
     ) -> int:
         """Get the number of blocks needed to be allocated for the request.
 
@@ -206,6 +207,8 @@ class SingleTypeKVCacheManager(ABC):
                 same value the scheduler splits chunks against. Mamba reserves
                 a prefill checkpoint only on the chunk reaching it; 0 (dense
                 retention) reserves one on every chunk.
+            max_cache_hit_length: The request's hit cap; Mamba saves its prefill
+                checkpoint at or before it.
 
         Returns:
             The number of blocks to allocate.
@@ -264,6 +267,12 @@ class SingleTypeKVCacheManager(ABC):
             # partial-hit CoW redirect.
             num_new_blocks += 1
         return num_new_blocks + num_evictable_blocks
+
+    def get_num_load_cow_blocks(self, num_loaded_tokens: int) -> int:
+        """Upper bound on the blocks a request whose async KV load ends at
+        `num_loaded_tokens` allocates on promotion that
+        `get_num_blocks_to_allocate` cannot see before the load is cached."""
+        return 0
 
     def add_local_computed_blocks(
         self,
@@ -875,6 +884,9 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             if self.use_eagle
             else request.num_prompt_tokens - 1
         )
+        if request.max_cache_hit_length is not None:
+            # Hits stop at the cap, where Mamba saves its checkpoint too.
+            token_limit = min(token_limit, request.max_cache_hit_length)
         boundary_tokens = (
             min(token_limit // hash_block_size, len(request.block_hashes))
             * hash_block_size
@@ -1210,6 +1222,7 @@ class CircularBufferManager(FullAttentionManager):
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
+        max_cache_hit_length: int | None = None,
     ) -> int:
         return 0 if self.req_to_blocks.get(request_id) else 1
 
@@ -1689,6 +1702,16 @@ class MambaManager(SingleTypeKVCacheManager):
             )
         )
 
+    def get_num_load_cow_blocks(self, num_loaded_tokens: int) -> int:
+        # Caching a load that ends inside a block registers a partial hit
+        # (`_cache_partial_tail_block`), whose state promotion copies into a
+        # new block. An upper bound: a trimmed boundary it doesn't key (a
+        # failed load) needs none.
+        return int(
+            self.mamba_cache_mode == "align"
+            and num_loaded_tokens % self.block_size != 0
+        )
+
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
@@ -1699,6 +1722,7 @@ class MambaManager(SingleTypeKVCacheManager):
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
+        max_cache_hit_length: int | None = None,
     ) -> int:
         assert isinstance(self.kv_cache_spec, MambaSpec)
         if (
@@ -1726,6 +1750,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 num_tokens_main_model,
                 apply_admission_cap=apply_admission_cap,
                 prefill_end=prefill_end,
+                max_cache_hit_length=max_cache_hit_length,
             )
         else:
             # We don't allocate blocks for lookahead tokens in align mode, because if
@@ -1763,6 +1788,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 self.cache_hit_alignment_tokens,
                 self.drop_eagle_checkpoint_block,
                 num_hash_lookahead_tokens=self.block_pool.num_hash_lookahead_tokens,
+                max_cache_hit_length=max_cache_hit_length,
             )
             if not self._needs_internal_checkpoint(
                 request_id,
@@ -2049,6 +2075,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     self.cache_hit_alignment_tokens,
                     self.drop_eagle_checkpoint_block,
                     num_hash_lookahead_tokens=self.block_pool.num_hash_lookahead_tokens,
+                    max_cache_hit_length=request.max_cache_hit_length,
                 )
             )
             is_retained_checkpoint = False
@@ -2089,6 +2116,7 @@ class MambaManager(SingleTypeKVCacheManager):
             hash_block_size,
             self.drop_eagle_checkpoint_block,
             num_hash_lookahead_tokens=self.block_pool.num_hash_lookahead_tokens,
+            max_cache_hit_length=request.max_cache_hit_length,
         )
         # The junction is the other position a sibling resumes at: where one was
         # observed to stop, and where the scheduler already ends a chunk. Bounded
@@ -2277,6 +2305,7 @@ class HiSparseSourceManager(FullAttentionManager):
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
+        max_cache_hit_length: int | None = None,
     ) -> int:
         required = super().get_num_blocks_to_allocate(
             request_id,
@@ -2408,6 +2437,7 @@ class HiSparseHotManager(_HiSparseAuxiliaryManager):
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
+        max_cache_hit_length: int | None = None,
     ) -> int:
         assert not new_computed_blocks
         # A hot region is needed to read host-backed history: an external
@@ -2488,6 +2518,7 @@ class HiSparseResidentManager(_HiSparseAuxiliaryManager):
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
+        max_cache_hit_length: int | None = None,
     ) -> int:
         del num_tokens_main_model
         assert not new_computed_blocks

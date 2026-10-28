@@ -54,6 +54,8 @@ class NewRequestData:
     prefill_token_ids: list[int] | None = None
     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
     replay_start: int = 0
+    # See Request.max_cache_hit_length; Mamba prefill checkpoints follow it.
+    max_cache_hit_length: int | None = None
 
     @classmethod
     def from_request(
@@ -80,6 +82,7 @@ class NewRequestData:
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
             replay_start=request.replay_start,
+            max_cache_hit_length=request.max_cache_hit_length,
         )
 
     @property

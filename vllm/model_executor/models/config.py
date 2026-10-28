@@ -1176,7 +1176,7 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
                 f"unsupported decision_config.json pooling {decision['pooling']!r}"
             )
         attention_mode = decision.get("attention_mode", "causal")
-        if attention_mode not in ("causal", "noncausal_full_attention"):
+        if attention_mode not in ("causal", "noncausal_full_attention", "prefix_bidir"):
             raise ValueError(
                 f"unsupported decision_config.json attention_mode {attention_mode!r}"
             )
@@ -1187,15 +1187,35 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
                 "decision_config.json must list one token id per answer code"
             )
 
-        # The full attention layers read the whole prompt in both directions;
-        # the Gated DeltaNet layers stay causal.
-        is_causal = attention_mode == "causal"
-        for config in {
-            id(config): config for config in (hf_config, model_config.hf_text_config)
-        }.values():
-            config.is_causal = is_causal
+        if attention_mode == "prefix_bidir":
+            # The full attention layers stay decoder layers that read each
+            # request's state and question blocks as PrefixLM ranges
+            # (`D3PrefixBidirModelState`). The prompt as a whole is still read
+            # bidirectionally, so chunked prefill and prefix caching stay off
+            # unless prefix caching is asked for (`_enable_state_caching`).
+            if model_config.hf_text_config is hf_config:
+                raise ValueError("prefix_bidir needs a separate text config")
+            hf_config.is_causal = False
+        else:
+            # The full attention layers read the whole prompt in both
+            # directions; the Gated DeltaNet layers stay causal.
+            is_causal = attention_mode == "causal"
+            for config in {
+                id(config): config
+                for config in (hf_config, model_config.hf_text_config)
+            }.values():
+                config.is_causal = is_causal
         # One readout row per answer code.
         hf_config.id2label = dict(enumerate(codes))
+        # The length the checkpoint was validated at is the default limit;
+        # --max-model-len still reaches the model's positions.
+        validated = decision.get("validated_length")
+        if validated and model_config.original_max_model_len is None:
+            model_config.max_model_len = min(model_config.max_model_len, validated)
+            logger.info(
+                "Using max model len %d, the checkpoint's validated length",
+                model_config.max_model_len,
+            )
 
         # Probabilities only exist over a question's own options, so the head
         # returns raw code logits unless activation is requested.
@@ -1203,6 +1223,204 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
         assert pooler_config is not None
         if pooler_config.use_activation is None:
             pooler_config.use_activation = False
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        # The SSM cache dtype the user asked for, before the checkpoint's
+        # default fills in "auto".
+        requested_ssm_dtype = vllm_config.cache_config.mamba_ssm_cache_dtype
+        Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        decision = model_config.hf_config.decision_config
+        attention_mode = decision.get("attention_mode", "causal")
+        if attention_mode == "noncausal_full_attention":
+            if cache_config.enable_prefix_caching:
+                logger.info(
+                    "Disabling prefix caching for %s: its full attention reads "
+                    "the whole prompt in both directions, so no block is reusable",
+                    model_config.architecture,
+                )
+                cache_config.enable_prefix_caching = False
+            return
+        if attention_mode != "prefix_bidir":
+            return
+        D3ForSequenceClassificationConfig._check_prefix_bidir_attention(vllm_config)
+        if cache_config.enable_prefix_caching:
+            D3ForSequenceClassificationConfig._enable_state_caching(
+                vllm_config, requested_ssm_dtype
+            )
+
+    @staticmethod
+    def _check_prefix_bidir_attention(vllm_config: "VllmConfig") -> None:
+        """On Hopper only FlashAttention 4 applies the state and question
+        blocks; otherwise every prompt step runs on Triton attention."""
+        from vllm.platforms import current_platform
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        attention_config = vllm_config.attention_config
+        if (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(90)
+            and not (
+                attention_config.backend == AttentionBackendEnum.FLASH_ATTN
+                and attention_config.flash_attn_version == 4
+            )
+        ):
+            logger.warning(
+                "%s prefix_bidir prompts run on Triton attention on this GPU; "
+                "FlashAttention 4 is faster: --attention-config "
+                '\'{"backend": "FLASH_ATTN", "flash_attn_version": 4}\'',
+                vllm_config.model_config.architecture,
+            )
+
+    @staticmethod
+    def _enable_state_caching(
+        vllm_config: "VllmConfig", requested_ssm_dtype: str
+    ) -> None:
+        """Cache each prompt's state block (a PrefixLM prefix): prefill every
+        prompt from its cache hit in one step with
+        BidirectionalPrefixLMScheduler, and keep the Gated DeltaNet state of
+        the cached state blocks in float32."""
+        import vllm.envs as envs
+        from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn
+        from vllm.platforms import current_platform
+
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        scheduler_config = vllm_config.scheduler_config
+        architecture = model_config.architecture
+
+        _, gdn = qwen_gdn_linear_attn._resolve_gdn_prefill_backend(vllm_config)
+        if not (
+            gdn == "flashinfer"
+            or (gdn in ("triton", "aiter_flydsl") and current_platform.is_cuda_alike())
+        ):
+            logger.info(
+                "Disabling prefix caching for %s: the %s GDN prefill backend "
+                "saves no state inside a prefill step",
+                architecture,
+                gdn,
+            )
+            cache_config.enable_prefix_caching = False
+            return
+
+        prefix_lm = "vllm.v1.core.sched.prefix_lm_scheduler."
+        schedulers = (
+            f"{prefix_lm}BidirectionalPrefixLMScheduler",
+            f"{prefix_lm}BidirectionalPrefixLMAsyncScheduler",
+        )
+        unsupported = {
+            "KV transfer connectors": vllm_config.kv_transfer_config,
+            # CPU offloading of state blocks: the native OffloadingConnector
+            # honors the per-request hit cap the scheduler sets, and loads a
+            # state saved inside a Mamba block as a partial tail, so a loaded
+            # hit ends on a saved Gated DeltaNet state.
+            "--kv-offloading-backend other than native": (
+                cache_config.kv_offloading_size is not None
+                and (
+                    cache_config.kv_offloading_backend != "native"
+                    or envs.VLLM_USE_SIMPLE_KV_OFFLOAD
+                )
+            ),
+            "speculative decoding": vllm_config.speculative_config,
+            # Measured no faster than FCFS. Also defence in depth: a step it
+            # preempts could leave eager cache entries (the checkpoint and
+            # attention tail at the hit cap) keyed over unwritten KV until
+            # upstream #59963 / #43569 (issue #59907) is in, though pooling
+            # requests don't reach that path.
+            "--scheduling-policy priority": scheduler_config.policy == "priority",
+            # Periodic checkpoints are not validated with checkpoints at the
+            # hit cap.
+            "--prefix-cache-retention-interval": bool(
+                cache_config.prefix_cache_retention_interval
+            ),
+            "context parallelism": (
+                vllm_config.parallel_config.prefill_context_parallel_size > 1
+                or vllm_config.parallel_config.decode_context_parallel_size > 1
+            ),
+            "micro-batching": vllm_config.parallel_config.use_ubatching,
+            "--scheduler-cls": scheduler_config.scheduler_cls
+            not in (None, *schedulers),
+            # Each prompt is prefilled whole from its cache hit.
+            "--long-prefill-token-threshold": (
+                scheduler_config.long_prefill_token_threshold > 0
+            ),
+        }
+        if features := [name for name, enabled in unsupported.items() if enabled]:
+            raise ValueError(
+                f"Prefix caching of {architecture} prefix_bidir prompts does not "
+                f"support {', '.join(features)}"
+            )
+
+        # A cached state block resumes the Gated DeltaNet state saved at its
+        # last block boundary; in bfloat16 that state would differ from the
+        # one a full prefill carries. This overrides the checkpoint's default.
+        if requested_ssm_dtype == "auto":
+            cache_config.mamba_ssm_cache_dtype = "float32"
+        elif requested_ssm_dtype != "float32":
+            raise ValueError(
+                f"Prefix caching of {architecture} prefix_bidir prompts needs "
+                f"--mamba-ssm-cache-dtype float32, not {requested_ssm_dtype}"
+            )
+
+        # A state's hit lands on the Gated DeltaNet state its prefill saves
+        # inside the step, at its last multiple of the prefix match unit, so
+        # a question recomputes at most that many state tokens. FlashInfer
+        # saves states only every 64 tokens.
+        unit = 64 if gdn == "flashinfer" else 16
+        # CPU offloading stores that state as a partial tail at the same
+        # position (the Mamba checkpoint hand-off carries it).
+        if cache_config.prefix_match_unit is None:
+            cache_config.prefix_match_unit = unit
+        elif cache_config.prefix_match_unit % unit:
+            raise ValueError(
+                f"Prefix caching of {architecture} prefix_bidir prompts with "
+                f"the {gdn} GDN prefill backend needs --prefix-match-unit a "
+                f"multiple of {unit}, not {cache_config.prefix_match_unit}"
+            )
+
+        # Each prompt is prefilled from its cache hit in one step; the Mamba
+        # prefix cache needs chunked prefill on for that (off by default for
+        # this bidirectional pooling model).
+        scheduler_config.enable_chunked_prefill = True
+        if scheduler_config.scheduler_cls is None:
+            scheduler_config.scheduler_cls = schedulers[0]
+        if not scheduler_config.user_specified_max_num_batched_tokens:
+            scheduler_config.max_num_batched_tokens = max(
+                scheduler_config.max_num_batched_tokens, model_config.max_model_len
+            )
+        # A prompt is prefilled whole, so a step needs the media of one prompt,
+        # at most max_model_len tokens. Size the encoder budget to that, not to
+        # the token budget it was derived from: smaller, a prompt with much
+        # media would never fit; larger, the vision tower's startup profiling
+        # overflows int32 indexing (about 196K tokens and up on Qwen3.5).
+        scheduler_config.max_num_encoder_input_tokens = model_config.max_model_len
+        scheduler_config.encoder_cache_size = model_config.max_model_len
+        budgets = {
+            "--max-num-batched-tokens": scheduler_config.max_num_batched_tokens,
+            "--max-num-scheduled-tokens": scheduler_config.max_num_scheduled_tokens,
+        }
+        for flag, budget in budgets.items():
+            if budget is not None and budget < model_config.max_model_len:
+                raise ValueError(
+                    f"Prefix caching of {architecture} prefix_bidir prompts "
+                    f"prefills each prompt in one step, so {flag} ({budget}) "
+                    f"must be at least --max-model-len ({model_config.max_model_len})"
+                )
+        logger.info(
+            "Caching the state blocks of %s prefix_bidir prompts (prefix "
+            "caching is supported for them; a warning that this pooling model "
+            "does not officially support it does not apply): scheduler %s, "
+            "chunked prefill on, max_num_batched_tokens %d, encoder budget "
+            "%d, SSM state cache %s, prefix match unit %d",
+            architecture,
+            scheduler_config.scheduler_cls,
+            scheduler_config.max_num_batched_tokens,
+            scheduler_config.max_num_encoder_input_tokens,
+            cache_config.mamba_ssm_cache_dtype,
+            cache_config.prefix_match_unit,
+        )
 
 
 class SnowflakeGteNewModelConfig(VerifyAndUpdateConfig):

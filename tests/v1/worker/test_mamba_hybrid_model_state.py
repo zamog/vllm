@@ -38,6 +38,7 @@ HAS_GPU = current_platform.is_cuda_alike() or current_platform.is_xpu()
 
 def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> None:
     state = object.__new__(MambaHybridModelState)
+    state.supports_mm_inputs = False
     state.vllm_config = SimpleNamespace(num_speculative_tokens=0)
     state.model_config = SimpleNamespace(max_model_len=8192)
     state._align_mode = False
@@ -88,10 +89,15 @@ def test_add_request_seeds_state_idx_in_mamba_blocks() -> None:
     state.prompt_embeds_state = None
     state.num_accepted_tokens_gpu = torch.ones(2, dtype=torch.int32)
     state._mamba_state_idx_gpu = torch.zeros(2, dtype=torch.int32)
+    state._max_cache_hit_length_np = np.full(2, 7, dtype=np.int32)
 
-    state.add_request(1, SimpleNamespace(num_computed_tokens=107_360))
+    state.add_request(
+        1, SimpleNamespace(num_computed_tokens=107_360, max_cache_hit_length=None)
+    )
 
     assert state._mamba_state_idx_gpu[1] == 121
+    # A reused slot drops the previous request's hit cap.
+    assert state._max_cache_hit_length_np[1] == -1
 
 
 def test_padded_prompt_tail_builds_as_spec_decode(
@@ -104,6 +110,7 @@ def test_padded_prompt_tail_builds_as_spec_decode(
     """
     k = 3
     state = object.__new__(MambaHybridModelState)
+    state.supports_mm_inputs = False
     state.vllm_config = SimpleNamespace(num_speculative_tokens=k)
     state.model_config = SimpleNamespace(max_model_len=8192)
     state._align_mode = False
@@ -169,6 +176,7 @@ def test_padded_prompt_tail_builds_as_spec_decode(
 
 def _mamba_hybrid_state(num_speculative_tokens: int) -> MambaHybridModelState:
     state = object.__new__(MambaHybridModelState)
+    state.supports_mm_inputs = False
     state.vllm_config = SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
     state.model_config = SimpleNamespace(max_model_len=8192)
     state._align_mode = False

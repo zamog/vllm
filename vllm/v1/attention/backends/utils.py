@@ -206,6 +206,129 @@ def fill_mm_prefix_query_ranges(
     return num_actual_tokens
 
 
+@dataclass
+class MMPrefixSegments:
+    """Scheduled query rows of one attention call that reads PrefixLM ranges as
+    virtual sequences (see `split_mm_prefix_segments`)."""
+
+    #: Packed query rows of the call in segment order, or None when they are
+    #: all the batch's rows in order.
+    rows: np.ndarray | None
+    #: Request index of each segment.
+    req_idx: np.ndarray
+    #: Query offsets of the segments within `rows`, `(num_segments + 1,)`.
+    cu_seqlens_q: np.ndarray
+    #: Keys each segment reads: every key before this.
+    seqused_k: np.ndarray
+    #: Whether a causal segment ends at its request's last token, so its key
+    #: count is the request's sequence length (exact only on the device for
+    #: decode rows; the CPU value is an upper bound).
+    ends_at_seq_len: np.ndarray
+    max_seqlen_q: int
+    max_seqlen_k: int
+
+
+def split_mm_prefix_segments(
+    mm_prefix_range: dict[int, list[tuple[int, int]]] | None,
+    query_start_loc_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+) -> tuple[MMPrefixSegments | None, MMPrefixSegments | None] | None:
+    """Split a batch with PrefixLM ranges into non-causal and causal virtual
+    sequences, so attention kernels without a mask hook can read it.
+
+    Under ``causal OR same range`` a query row inside a range ``[start, end]``
+    reads every key up to ``end``, a prefix of the sequence, and a row outside
+    every range reads up to itself. So each request's scheduled rows split into
+    runs: a run inside one range is a non-causal sequence over keys
+    ``[0, min(end + 1, seq_len))``; a run outside every range is a causal
+    sequence over keys ``[0, last row + 1)``. Both read the request's KV cache
+    through its block table.
+
+    Returns ``(non_causal, causal)`` (either None when empty), or None when no
+    range covers a scheduled query row. Ranges must not overlap; degenerate
+    ranges (``start >= end``) are ignored, as `fill_mm_prefix_query_ranges`
+    does.
+    """
+    if not mm_prefix_range:
+        return None
+    query_start_loc = query_start_loc_cpu.numpy()
+    seq_lens = seq_lens_cpu.numpy()
+    num_reqs = len(query_start_loc) - 1
+    # (req_idx, first packed row, rows, keys) per segment and kind.
+    segments: tuple[list[tuple[int, int, int, int]], ...] = ([], [])
+    found = False
+    for req_idx in range(num_reqs):
+        token_start = int(query_start_loc[req_idx])
+        query_len = int(query_start_loc[req_idx + 1]) - token_start
+        if query_len <= 0:
+            continue
+        seq_len = int(seq_lens[req_idx])
+        context = seq_len - query_len
+        pos = context  # absolute position of the next unassigned row
+        for start, end in sorted(mm_prefix_range.get(req_idx, ())):
+            if start >= end:
+                continue
+            first = max(start, pos)
+            last = min(end, seq_len - 1)
+            if first > last:
+                continue
+            found = True
+            if first > pos:
+                # Causal rows before the range.
+                segments[1].append(
+                    (req_idx, token_start + pos - context, first - pos, first)
+                )
+            segments[0].append(
+                (
+                    req_idx,
+                    token_start + first - context,
+                    last - first + 1,
+                    min(end + 1, seq_len),
+                )
+            )
+            pos = last + 1
+        if pos < seq_len:
+            # Causal rows after the last range; they end at the sequence end.
+            segments[1].append(
+                (req_idx, token_start + pos - context, seq_len - pos, seq_len)
+            )
+    if not found:
+        return None
+    num_tokens = int(query_start_loc[-1])
+    out: list[MMPrefixSegments | None] = []
+    for group in segments:
+        if not group:
+            out.append(None)
+            continue
+        req = np.array([s[0] for s in group], dtype=np.int32)
+        lens = np.array([s[2] for s in group], dtype=np.int32)
+        cu = np.zeros(len(group) + 1, dtype=np.int32)
+        np.cumsum(lens, out=cu[1:])
+        rows = np.concatenate(
+            [np.arange(s[1], s[1] + s[2], dtype=np.int64) for s in group]
+        )
+        identity = len(rows) == num_tokens and bool(
+            (rows == np.arange(num_tokens)).all()
+        )
+        seqused_k = np.array([s[3] for s in group], dtype=np.int32)
+        out.append(
+            MMPrefixSegments(
+                rows=None if identity else rows,
+                req_idx=req,
+                cu_seqlens_q=cu,
+                seqused_k=seqused_k,
+                ends_at_seq_len=(
+                    seqused_k == seq_lens[req]
+                    if group is segments[1]
+                    else np.zeros(len(group), dtype=bool)
+                ),
+                max_seqlen_q=int(lens.max()),
+                max_seqlen_k=max(s[3] for s in group),
+            )
+        )
+    return out[0], out[1]
+
+
 _FLASHINFER_LAYOUT_NAMES = {
     "LBNHC": "NHD",
     "LBHNC": "HND",
