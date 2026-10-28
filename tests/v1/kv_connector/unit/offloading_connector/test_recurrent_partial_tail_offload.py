@@ -285,3 +285,30 @@ def test_a_state_capped_on_a_block_boundary_loads_from_cpu(s: int):
     assert question.status == RequestStatus.WAITING_FOR_REMOTE_KVS
     assert question.num_computed_tokens == s
     assert len(meta.load_jobs) == 1
+
+
+def test_a_sync_load_of_a_mid_block_state_needs_no_cow():
+    # A small hit loads within the step. Ending inside a block, the request
+    # writes no cache, so the loaded state is never shared: unlike an async
+    # load's promotion, no partial hit is registered and no CoW block is due.
+    h = Harness()
+    h.cs.config = h.cs.config._replace(sync_load_budget_bytes=1 << 40)
+    s = 150
+    prefix = list(range(1000, 1000 + s))
+    warm_up = h.request("w", prefix, prefix_len=None)
+    h.step(warm_up)
+    for _ in range(3):
+        h.step()
+    assert h.scheduler.kv_cache_manager.reset_prefix_cache()
+
+    prompt = prefix + list(range(5000, 5020))
+    question = h.request("q", prompt, prefix_len=s)
+    out, meta = h.step(question)
+    [load] = meta.load_jobs.values()
+    assert load.sync
+    assert out.num_scheduled_tokens == {"q": len(prompt) - 144}
+    [scheduled] = [r for r in out.scheduled_new_reqs if r.req_id == "q"]
+    assert scheduled.block_ids[1][(144 - 1) // BLOCK] != 0  # the loaded state
+    assert question.skip_writing_prefix_cache
+    for manager in h.scheduler.kv_cache_manager.coordinator.single_type_managers:
+        assert "q" not in manager._partial_hit_reqs
