@@ -1177,7 +1177,8 @@ def get_mamba_prefill_checkpoint_position(
 
     ``max_cache_hit_length`` is the request's hit cap
     (``Request.max_cache_hit_length``): a later hit never passes it, so the
-    checkpoint is saved at or before it.
+    checkpoint is saved at or before it. The cap bounds the position after
+    ``num_hash_lookahead_tokens`` has left its tokens; the tighter one wins.
     """
     # Leave tokens for logits recomputation and the checkpoint's hash.
     # EAGLE's block drop already leaves tokens to recompute.
